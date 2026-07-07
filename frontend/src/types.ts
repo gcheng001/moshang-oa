@@ -1,0 +1,115 @@
+export interface User {
+  userId: number;
+  userName: string;
+  employeeId: number | null;
+  employeeName: string | null;
+  lawfirmName: string | null;
+}
+
+export interface CaseRow {
+  id: number;
+  no: string | null;
+  preNo: string | null;
+  status: number;
+  statusName: string;
+  shouliDate: string | null;
+  createTime: string | null;
+  caseCategoryName: string | null;
+  baseTypeName: string | null;
+  causeAction: string | null;
+  caseHeadName?: string | null;
+  wtrNames: string | null;
+  dsrNames: string | null;
+  tosNames: string | null;
+  empNames: string | null;
+  chargeAmount: number | null;
+  otherCharge: number | null;
+  yishou: number | null;
+  weishou: number | null;
+}
+
+export interface CaseListResponse {
+  total: number;
+  rows: CaseRow[];
+}
+
+export interface PendingResponse {
+  filing: CaseRow[];
+  closing: CaseRow[];
+}
+
+export interface ConflictFinding {
+  matched_name: string;
+  relation: string;
+  severity: string;
+  case_id: number;
+  case_no: string | null;
+  status: number;
+  status_name: string | null;
+  wtr_names: string | null;
+  tos_names: string | null;
+  cause: string | null;
+}
+
+export interface DuplicateFinding {
+  severity: string;
+  relation: string;
+  case_id: number;
+  case_no: string | null;
+  status: number | null;
+  status_name: string | null;
+  wtr_names: string | null;
+  tos_names: string | null;
+  cause: string | null;
+  emp_names: string | null;
+  principal_overlap: string[];
+  opponent_overlap: string[];
+  cause_match: boolean;
+}
+
+export interface ApprovalReview {
+  lawcase_id: number;
+  case_no: string | null;
+  status: number;
+  status_name: string;
+  completeness: { result: string; missing: string[]; warnings: string[] };
+  conflict: {
+    result: string;
+    principals: string[];
+    opponents: string[];
+    blockers: string[];
+    findings: ConflictFinding[];
+    limitations: string[];
+  };
+  duplicate_filing: {
+    result: string;
+    blockers: string[];
+    findings: DuplicateFinding[];
+    limitations: string[];
+  };
+  fee_explanation: {
+    result: string;
+    amount: number | null;
+    memo: string | null;
+    memo_amounts?: number[];
+    blockers?: string[];
+  };
+  risk_charge: {
+    result: string;
+    verdict?: "preliminary_pass" | "issues_found";
+    charge_method: string | null;
+    scheme?: string | null;
+    subject_amount: number | null;
+    registered_fee?: number | null;
+    scheme_amounts?: number[];
+    graduated_cap: number | null;
+    cap_breakdown?: { range: string; rate: string; portion: number; fee: number }[];
+    prohibited_matches?: string[];
+    issues?: string[];
+    suggestions?: string[];
+    notes?: string[];
+    basis?: string;
+  };
+  gate_errors: string[];
+  detail: Record<string, unknown>;
+}

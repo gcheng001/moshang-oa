@@ -1,0 +1,667 @@
+"""摩尚OA client — ported from the verified skill script oa_probe.py.
+
+All read paths (login, case list/detail, approval checks) are side-effect free.
+The only write path is Lianshenpi (filing approval), guarded by the compliance
+gate and followed by a read-back verification.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+import unicodedata
+from decimal import Decimal, InvalidOperation
+from typing import Any
+from urllib.parse import urljoin
+
+import requests
+
+DEFAULT_BASE_URL = "https://moshang2.ycq6.com"
+
+ACTIVE_CASE_STATUSES = {-1, 0, 1, 3, 4}
+ACTIVE_DUPLICATE_STATUSES = {1, 2, 3, 4, 5}
+RISK_CHARGE_METHOD_ID = 5
+RISK_PROHIBITED_KEYWORDS = (
+    "刑事",
+    "行政诉讼",
+    "国家赔偿",
+    "群体性诉讼",
+    "婚姻",
+    "离婚",
+    "继承",
+    "社会保险",
+    "最低生活保障",
+    "赡养费",
+    "抚养费",
+    "扶养费",
+    "抚恤金",
+    "救济金",
+    "工伤赔偿",
+    "劳动报酬",
+)
+RISK_FEE_TIERS = (
+    (Decimal("1000000"), Decimal("0.18")),
+    (Decimal("4000000"), Decimal("0.15")),
+    (Decimal("5000000"), Decimal("0.12")),
+    (Decimal("40000000"), Decimal("0.09")),
+    (None, Decimal("0.06")),
+)
+
+
+class OAError(RuntimeError):
+    """Raised when the OA returns an error envelope or unexpected shape."""
+
+
+# ---------------------------------------------------------------- transport
+
+
+def login(base_url: str, api_key: str) -> str:
+    url = urljoin(base_url.rstrip("/") + "/", "DataServices/AgentAPI/Login")
+    resp = requests.get(url, params={"apikey": api_key}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    token = ((data or {}).get("data") or {}).get("token")
+    if not token:
+        raise OAError(f"登录失败：OA 未返回 token（{data.get('msg') or data}）")
+    return token
+
+
+def agent_get(base_url: str, token: str, action: str, params: dict[str, Any] | None = None) -> Any:
+    url = urljoin(base_url.rstrip("/") + "/", f"DataServices/AgentAPI/{action}")
+    resp = requests.get(url, headers={"nedev_access_token": token}, params=params or {}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def post_form(base_url: str, token: str, path: str, form: dict[str, str]) -> Any:
+    url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    resp = requests.post(url, headers={"nedev_access_token": token}, data=form, timeout=30)
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except ValueError:
+        return {"text": resp.text}
+
+
+def response_data(result: Any) -> Any:
+    if isinstance(result, dict):
+        code = result.get("code")
+        if code == 200 and "data" in result:
+            return result["data"]
+        if code is not None and code != 200:
+            raise OAError(str(result.get("msg") or f"OA 返回 code={code}"))
+    return result
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value or "")).casefold()
+
+
+def split_names(value: Any) -> list[str]:
+    if not value:
+        return []
+    values = value if isinstance(value, list) else re.split(r"[、,，;；/\n]+", str(value))
+    return [name.strip() for name in values if str(name).strip()]
+
+
+def decimal_value(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+# 收费文本金额提取：取带货币标记的金额（元/块 结尾、¥/￥ 开头、或 万/千 单位），排除费率百分比
+_ARABIC_AMOUNT = re.compile(
+    r"[￥¥]\s*([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万|千)?"
+    r"|([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万|千)?\s*(?:元|块)"
+)
+_BARE_UNIT_AMOUNT = re.compile(r"([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万|千)(?![分克米瓦])")
+_CN_AMOUNT = re.compile(r"([零一二两三四五六七八九十百千万亿]{1,12})\s*(?:元|块)")
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
+# 金额前若紧跟这些语境词，视为标的/损失等案值而非收费，不参与比对
+_NON_FEE_CONTEXT = ("标的", "赔偿", "争议", "损失", "涉案", "欠款", "借款", "货款", "本金", "利息")
+
+
+def _cn_numeral_to_decimal(text: str) -> Decimal | None:
+    total, section, digit = 0, 0, 0
+    for ch in text:
+        if ch in _CN_DIGITS:
+            digit = _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if unit >= 10000:
+                total = (total + section + digit) * unit
+                section, digit = 0, 0
+            else:
+                section += (digit or 1) * unit
+                digit = 0
+        else:
+            return None
+    result = total + section + digit
+    return Decimal(result) if result > 0 else None
+
+
+def extract_fee_amounts(text: str) -> list[Decimal]:
+    """从收费方案/收费说明文本中提取疑似收费金额。
+
+    按文本位置去重（同一处文字只计一次），保留重复金额以支持分期合计比对。
+    """
+    text = text or ""
+    found: list[tuple[int, int, Decimal]] = []
+
+    def add(start: int, end: int, value: Decimal | None) -> None:
+        if value is None or value <= 0:
+            return
+        prefix = text[max(0, start - 8) : start]
+        if any(kw in prefix for kw in _NON_FEE_CONTEXT):
+            return
+        if any(start < e and end > s for s, e, _ in found):
+            return
+        found.append((start, end, value))
+
+    for match in _ARABIC_AMOUNT.finditer(text):
+        number = match.group(1) or match.group(3)
+        unit = match.group(2) if match.group(1) else match.group(4)
+        value = decimal_value(number.replace(",", "").replace("，", ""))
+        if value is not None and unit:
+            value *= {"万": 10000, "千": 1000}[unit]
+        add(match.start(), match.end(), value)
+    for match in _BARE_UNIT_AMOUNT.finditer(text):
+        value = decimal_value(match.group(1).replace(",", "").replace("，", ""))
+        if value is not None:
+            value *= {"万": 10000, "千": 1000}[match.group(2)]
+        add(match.start(), match.end(), value)
+    for match in _CN_AMOUNT.finditer(text):
+        add(match.start(), match.end(), _cn_numeral_to_decimal(match.group(1)))
+
+    return [value for _, _, value in sorted(found, key=lambda item: item[0])]
+
+
+def fee_amounts_match(registered: Decimal, scheme_amounts: list[Decimal]) -> bool:
+    """登记收费与方案金额是否可对上：等于其中某笔，或等于各笔合计。"""
+    return not scheme_amounts or registered in scheme_amounts or registered == sum(scheme_amounts)
+
+
+def format_amounts(amounts: list[Decimal]) -> str:
+    return "、".join(f"{a:,.0f} 元" for a in amounts)
+
+
+def risk_fee_cap(subject_amount: Any) -> Decimal | None:
+    """Graduated maximum fee under 司发通〔2021〕87号第六项."""
+    amount = decimal_value(subject_amount)
+    if amount is None or amount <= 0:
+        return None
+    remaining = amount
+    cap = Decimal("0")
+    for width, rate in RISK_FEE_TIERS:
+        portion = remaining if width is None else min(remaining, width)
+        cap += portion * rate
+        remaining -= portion
+        if remaining <= 0:
+            break
+    return cap.quantize(Decimal("0.01"))
+
+
+# ---------------------------------------------------------------- queries
+
+
+def get_profile(base_url: str, token: str) -> dict[str, Any]:
+    result = response_data(agent_get(base_url, token, "GetAgentProfile"))
+    if not isinstance(result, dict):
+        raise OAError(f"GetAgentProfile 返回异常：{result!r}")
+    return result
+
+
+def get_case_list(base_url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
+    payload = response_data(agent_get(base_url, token, "GetLawcases", params))
+    if not isinstance(payload, dict):
+        raise OAError(f"GetLawcases 返回异常：{payload!r}")
+    return payload
+
+
+def get_case_list_all(base_url: str, token: str, keyword: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    page_index = 0
+    while True:
+        payload = get_case_list(
+            base_url, token, {"keyword": keyword, "pageIndex": page_index, "pageSize": 100}
+        )
+        page = payload.get("data") or []
+        rows.extend(row for row in page if isinstance(row, dict))
+        if not page or len(rows) >= int(payload.get("total") or 0):
+            return rows
+        page_index += 1
+
+
+def get_case_detail(base_url: str, token: str, lawcase_id: int) -> dict[str, Any]:
+    result = response_data(agent_get(base_url, token, "GetLawcaseDetail", {"lawcaseId": lawcase_id}))
+    if not isinstance(result, dict):
+        raise OAError(f"GetLawcaseDetail 返回异常：{result!r}")
+    return result
+
+
+def get_case_entity(base_url: str, token: str, lawcase_id: int, detail: dict[str, Any]) -> dict[str, Any]:
+    base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+    owners = ["Page:LawcaseDetails_刑事@1"] if "刑事" in base_type else ["Page:LawcaseDetails_民事@1"]
+    result = post_form(
+        base_url,
+        token,
+        "/DataService/GetEntity",
+        {
+            "entityType": "ApplicationData.Lawcase",
+            "entityKeys": json.dumps([lawcase_id]),
+            "owners": json.dumps(owners, ensure_ascii=False),
+        },
+    )
+    value = result.get("Value") if isinstance(result, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def party_names(detail: dict[str, Any]) -> tuple[list[str], list[str]]:
+    clients = [row for row in (detail.get("clients") or []) if isinstance(row, dict)]
+    principals = [str(row.get("name") or "").strip() for row in clients if row.get("roleType") == 0]
+    opponents = [str(row.get("name") or "").strip() for row in clients if row.get("roleType") == 1]
+    return (
+        [n for n in principals if n] or split_names(detail.get("wtrNames") or detail.get("dsrNames")),
+        [n for n in opponents if n] or split_names(detail.get("tosNames")),
+    )
+
+
+def row_case_id(row: dict[str, Any]) -> int:
+    try:
+        return int(row.get("id") or row.get("lawcaseId") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def row_status(row: dict[str, Any]) -> int | None:
+    try:
+        return int(row.get("status"))
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------------- approval reviews
+
+
+def completeness_review(detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+    principals, opponents = party_names(detail)
+    missing = []
+    # 案情摘要缺失不拦截（2026-07-08 合伙人确认），只作提示
+    checks = {
+        "委托人": principals,
+        "对方": opponents,
+        "经办律师": detail.get("empNames") or detail.get("employees"),
+        "案由": detail.get("causeAction") or detail.get("caseHeadName"),
+        "案件阶段": detail.get("instances"),
+        "收费方式": detail.get("chargeMethodName") or entity.get("chargeMethd"),
+        "委托收费金额": detail.get("chargeAmount"),
+    }
+    for label, value in checks.items():
+        if value in (None, "", []):
+            missing.append(label)
+    warnings = []
+    if detail.get("caseSummary") in (None, ""):
+        warnings.append("案情摘要未填写（不影响通过）")
+    return {"result": "blocked" if missing else "complete", "missing": missing, "warnings": warnings}
+
+
+def fee_explanation_review(detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+    """低收费审查：委托收费低于 5000 元必须有收费说明（ChargeMemo），否则不能通过。"""
+    amount = decimal_value(detail.get("chargeAmount"))
+    memo = str(entity.get("ChargeMemo") or "").strip()
+    if amount is None or amount >= Decimal("5000"):
+        return {"result": "not_applicable", "amount": float(amount) if amount is not None else None, "memo": memo or None}
+    if not memo:
+        return {
+            "result": "blocked",
+            "amount": float(amount),
+            "memo": None,
+            "blockers": [f"委托收费 {amount} 元低于 5000 元且未填写收费说明，不能通过；请在 OA 补充收费说明后重新检查"],
+        }
+    memo_amounts = extract_fee_amounts(memo)
+    if not fee_amounts_match(amount, memo_amounts):
+        return {
+            "result": "blocked",
+            "amount": float(amount),
+            "memo": memo,
+            "memo_amounts": [float(a) for a in memo_amounts],
+            "blockers": [
+                f"收费说明记载金额（{format_amounts(memo_amounts)}）与 OA 登记委托收费 {amount:,.0f} 元不一致，"
+                "登记与说明存在冲突；请核实以书面合同为准更正后重新检查"
+            ],
+        }
+    return {"result": "ok", "amount": float(amount), "memo": memo, "blockers": []}
+
+
+def conflict_review(base_url: str, token: str, detail: dict[str, Any], lawcase_id: int) -> dict[str, Any]:
+    principals, opponents = party_names(detail)
+    principal_keys = {normalize_name(name) for name in principals}
+    opponent_keys = {normalize_name(name) for name in opponents}
+    blockers = []
+    findings = []
+    if principal_keys & opponent_keys:
+        blockers.append("本案委托人与对方存在同名主体，必须更正或核实主体身份")
+
+    searched: dict[str, list[dict[str, Any]]] = {}
+    for name in dict.fromkeys(principals + opponents):
+        searched[name] = get_case_list_all(base_url, token, name)
+
+    seen = set()
+    for searched_name, rows in searched.items():
+        key = normalize_name(searched_name)
+        for row in rows:
+            row_id = row_case_id(row)
+            if row_id == lawcase_id:
+                continue
+            row_principals = {normalize_name(x) for x in split_names(row.get("wtrNames") or row.get("dsrNames"))}
+            row_opponents = {normalize_name(x) for x in split_names(row.get("tosNames"))}
+            relation = None
+            if key in principal_keys and key in row_opponents:
+                relation = "本案委托人曾/正在作为本所案件对方"
+            elif key in opponent_keys and key in row_principals:
+                relation = "本案对方曾/正在作为本所委托人"
+            if not relation:
+                continue
+            identity = (row_id, relation, key)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            status = int(row.get("status") or 0)
+            findings.append(
+                {
+                    "matched_name": searched_name,
+                    "relation": relation,
+                    "severity": "high" if status in ACTIVE_CASE_STATUSES else "review",
+                    "case_id": row_id,
+                    "case_no": row.get("no") or row.get("preNo"),
+                    "status": status,
+                    "status_name": row.get("statusName"),
+                    "wtr_names": row.get("wtrNames"),
+                    "tos_names": row.get("tosNames"),
+                    "cause": row.get("causeAction"),
+                }
+            )
+
+    return {
+        "result": "blocked" if blockers else ("manual_review_required" if findings else "no_exact_adverse_match"),
+        "principals": principals,
+        "opponents": opponents,
+        "blockers": blockers,
+        "findings": findings,
+        "limitations": [
+            "仅检索OA中可见案件并按规范化后的主体名称精确比对",
+            "同名、曾用名、关联企业、实际控制人和未录入OA事项仍须人工核验",
+            "命中是风险线索，不等于已经构成法律上的利益冲突",
+        ],
+    }
+
+
+def duplicate_filing_review(base_url: str, token: str, detail: dict[str, Any], lawcase_id: int) -> dict[str, Any]:
+    principals, opponents = party_names(detail)
+    principal_keys = {normalize_name(name): name for name in principals}
+    opponent_keys = {normalize_name(name): name for name in opponents}
+    current_cause = normalize_name(str(detail.get("causeAction") or detail.get("caseHeadName") or ""))
+
+    searched: dict[str, list[dict[str, Any]]] = {}
+    for name in dict.fromkeys(principals + opponents):
+        searched[name] = get_case_list_all(base_url, token, name)
+
+    candidates: dict[int, dict[str, Any]] = {}
+    for rows in searched.values():
+        for row in rows:
+            row_id = row_case_id(row)
+            if not row_id or row_id == lawcase_id:
+                continue
+            candidates.setdefault(row_id, row)
+
+    blockers: list[str] = []
+    findings: list[dict[str, Any]] = []
+    for row_id, row in candidates.items():
+        row_principals = {normalize_name(x): x for x in split_names(row.get("wtrNames") or row.get("dsrNames"))}
+        row_opponents = {normalize_name(x): x for x in split_names(row.get("tosNames"))}
+        row_cause = normalize_name(str(row.get("causeAction") or row.get("caseHeadName") or ""))
+        principal_overlap = [principal_keys[k] for k in principal_keys.keys() & row_principals.keys()]
+        opponent_overlap = [opponent_keys[k] for k in opponent_keys.keys() & row_opponents.keys()]
+        any_party_overlap = bool(
+            (set(principal_keys) | set(opponent_keys)) & (set(row_principals) | set(row_opponents))
+        )
+        cause_match = bool(current_cause and row_cause and current_cause == row_cause)
+        status = row_status(row)
+
+        if principal_overlap and opponent_overlap and cause_match and status in ACTIVE_DUPLICATE_STATUSES:
+            severity = "block"
+            relation = "同委托人+同对方+同案由的OA在办/待处理案件"
+            blockers.append(f"OA内疑似重复立案: {row.get('no') or row.get('preNo') or row_id} {relation}")
+        elif (cause_match and any_party_overlap) or (principal_overlap and opponent_overlap):
+            severity = "review"
+            relation = "部分当事人/案由重叠，需合伙人判断是否关联或重复"
+        else:
+            continue
+
+        findings.append(
+            {
+                "severity": severity,
+                "relation": relation,
+                "case_id": row_id,
+                "case_no": row.get("no") or row.get("preNo"),
+                "status": status,
+                "status_name": row.get("statusName"),
+                "wtr_names": row.get("wtrNames"),
+                "tos_names": row.get("tosNames"),
+                "cause": row.get("causeAction") or row.get("caseHeadName"),
+                "emp_names": row.get("empNames"),
+                "principal_overlap": principal_overlap,
+                "opponent_overlap": opponent_overlap,
+                "cause_match": cause_match,
+            }
+        )
+
+    return {
+        "result": "blocked" if blockers else ("manual_review_required" if findings else "no_duplicate_filing_match"),
+        "principals": principals,
+        "opponents": opponents,
+        "cause": detail.get("causeAction") or detail.get("caseHeadName"),
+        "blockers": blockers,
+        "findings": findings,
+        "limitations": [
+            "按OA可见案件做名称与案由精确匹配",
+            "同名不同主体、案由登记不一致、未录入OA案件仍须人工复核",
+        ],
+    }
+
+
+def is_risk_charge(detail: dict[str, Any], entity: dict[str, Any]) -> bool:
+    method_name = str(detail.get("chargeMethodName") or "")
+    method = entity.get("chargeMethd")
+    method_id = method.get("Id") if isinstance(method, dict) else method
+    return "风险" in method_name or str(method_id or "") == str(RISK_CHARGE_METHOD_ID)
+
+
+def risk_cap_breakdown(subject_amount: Decimal) -> list[dict[str, Any]]:
+    """Per-tier calculation lines for the graduated cap, for display."""
+    lines = []
+    remaining = subject_amount
+    lower = Decimal("0")
+    for width, rate in RISK_FEE_TIERS:
+        if remaining <= 0:
+            break
+        portion = remaining if width is None else min(remaining, width)
+        upper = None if width is None else lower + width
+        lines.append(
+            {
+                "range": f"{lower:,.0f} 元以上" if upper is None else f"{lower:,.0f} — {upper:,.0f} 元",
+                "rate": f"{rate * 100:.0f}%",
+                "portion": float(portion),
+                "fee": float((portion * rate).quantize(Decimal("0.01"))),
+            }
+        )
+        remaining -= portion
+        lower = upper if upper is not None else lower
+    return lines
+
+
+def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_amount: Any = None) -> dict[str, Any]:
+    """风险代理审查：列出收费方案，系统作初步合规判断并给建议，最终由合伙人人工确认。
+
+    2026-07-08 起不再硬阻断：所有问题作为初步判断意见呈现，通过前须合伙人勾选确认。
+    """
+    if not is_risk_charge(detail, entity):
+        return {"result": "not_applicable", "charge_method": detail.get("chargeMethodName")}
+
+    description = " ".join(
+        str(value or "")
+        for value in (
+            detail.get("baseTypeName"),
+            detail.get("caseCategoryName"),
+            detail.get("causeAction"),
+            detail.get("caseHeadName"),
+            detail.get("caseSummary"),
+        )
+    )
+    prohibited_hits = [kw for kw in RISK_PROHIBITED_KEYWORDS if kw in description]
+    base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+    if "行政" in base_type and "行政诉讼" not in prohibited_hits:
+        prohibited_hits.append("行政诉讼")
+
+    scheme = str(entity.get("ChargeMemo") or "").strip() or None
+    subject_amount = decimal_value(entity.get("Biaodi") or detail.get("biaodi"))
+    registered_fee = decimal_value(detail.get("chargeAmount"))
+    cap = risk_fee_cap(subject_amount)
+
+    issues: list[str] = []
+    suggestions: list[str] = []
+    if prohibited_hits:
+        issues.append("案件描述命中风险代理禁止适用情形: " + "、".join(prohibited_hits))
+        suggestions.append("若确属禁止范围，应驳回并改用计件/计时等收费方式")
+    if not scheme:
+        issues.append("OA 未填写收费方案（收费说明），无法审查具体收费结构")
+        suggestions.append("要求经办律师在 OA 补充完整收费方案后重新审查")
+    if subject_amount is None:
+        issues.append("缺少标的额，无法计算风险代理分段收费上限")
+        suggestions.append("补充标的额，或按合同争议金额人工核算上限")
+    if cap is not None and registered_fee is not None and registered_fee > cap:
+        issues.append(f"OA 登记收费 {registered_fee:,.0f} 元已超过分段上限 {cap:,.0f} 元")
+        suggestions.append("核对收费方案约定的最高可能收费，超上限应要求调整")
+
+    scheme_amounts = extract_fee_amounts(scheme) if scheme else []
+    if scheme_amounts and registered_fee is not None and not fee_amounts_match(registered_fee, scheme_amounts):
+        issues.append(
+            f"收费方案记载金额（{format_amounts(scheme_amounts)}）与 OA 登记收费 {registered_fee:,.0f} 元不一致，"
+            "登记与方案存在冲突"
+        )
+        suggestions.append("核对书面合同实际约定，更正 OA 登记收费或收费方案后再审批")
+    if cap is not None and scheme_amounts and sum(scheme_amounts) > cap:
+        issues.append(
+            f"收费方案记载固定金额合计 {sum(scheme_amounts):,.0f} 元已超过分段上限 {cap:,.0f} 元（尚未计入比例收费部分）"
+        )
+        suggestions.append("按方案各环节费用最高可能合计核算，超上限应要求调整方案")
+
+    if not issues:
+        verdict = "preliminary_pass"
+        if cap is not None:
+            suggestions.append(
+                f"初步符合规定。请人工核对收费方案中各环节费用合计的最高可能金额不超过 {cap:,.0f} 元，确认后通过"
+            )
+    else:
+        verdict = "issues_found"
+
+    return {
+        "result": "manual_confirmation_required",
+        "verdict": verdict,
+        "charge_method": detail.get("chargeMethodName"),
+        "scheme": scheme,
+        "subject_amount": float(subject_amount) if subject_amount is not None else None,
+        "registered_fee": float(registered_fee) if registered_fee is not None else None,
+        "scheme_amounts": [float(a) for a in scheme_amounts],
+        "graduated_cap": float(cap) if cap is not None else None,
+        "cap_breakdown": risk_cap_breakdown(subject_amount) if subject_amount is not None else [],
+        "prohibited_matches": prohibited_hits,
+        "issues": issues,
+        "suggestions": suggestions,
+        "notes": [
+            "OA 登记收费金额可能仅为首期费用，不必然等于方案最高收费，请以收费方案原文为准",
+            "通过前请同时确认：已签专门书面风险代理合同，且已醒目告知风险代理含义、禁止范围与最高收费限制",
+        ],
+        "basis": "司发通〔2021〕87号第四至七项",
+    }
+
+
+def build_approval_review(
+    base_url: str,
+    token: str,
+    lawcase_id: int,
+    detail: dict[str, Any],
+    risk_fee_amount: float | None = None,
+) -> dict[str, Any]:
+    entity = get_case_entity(base_url, token, lawcase_id, detail)
+    return {
+        "lawcase_id": lawcase_id,
+        "case_no": detail.get("no") or detail.get("preNo"),
+        "status": detail.get("status"),
+        "status_name": detail.get("statusName"),
+        "completeness": completeness_review(detail, entity),
+        "conflict": conflict_review(base_url, token, detail, lawcase_id),
+        "duplicate_filing": duplicate_filing_review(base_url, token, detail, lawcase_id),
+        "fee_explanation": fee_explanation_review(detail, entity),
+        "risk_charge": risk_charge_review(detail, entity, risk_fee_amount),
+    }
+
+
+def approval_gate_errors(
+    review: dict[str, Any],
+    *,
+    conflict_reviewed: bool = False,
+    conflict_memo: str = "",
+    risk_reviewed: bool = False,
+) -> list[str]:
+    errors = [f"资料不完整: {v}" for v in (review["completeness"].get("missing") or [])]
+    errors.extend(review["conflict"].get("blockers") or [])
+    findings = review["conflict"].get("findings") or []
+    if findings and not (conflict_reviewed and conflict_memo.strip()):
+        errors.append("存在利冲检索命中，须确认合伙人已人工复核并填写复核结论")
+    errors.extend(review.get("duplicate_filing", {}).get("blockers") or [])
+    errors.extend(review.get("fee_explanation", {}).get("blockers") or [])
+    risk = review["risk_charge"]
+    if risk.get("result") == "manual_confirmation_required" and not risk_reviewed:
+        errors.append("风险代理收费须合伙人审阅收费方案与初步判断后勾选确认")
+    return errors
+
+
+# ------------------------------------------------------- approval actions
+
+
+def post_lian_approval(base_url: str, token: str, lawcase_id: int, approved: bool, memo: str) -> Any:
+    result = post_form(
+        base_url,
+        token,
+        "/DataServices/LawcaseSvr/Lianshenpi",
+        {
+            "lId": str(lawcase_id),
+            "isApproved": "true" if approved else "false",
+            "memo": memo,
+        },
+    )
+    if isinstance(result, dict) and (result.get("Type") or result.get("Message")):
+        raise OAError(result.get("Message") or json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def verify_status_change(base_url: str, token: str, lawcase_id: int, expected_status: int) -> dict[str, Any]:
+    after: dict[str, Any] = {}
+    for _ in range(5):
+        after = get_case_detail(base_url, token, lawcase_id)
+        if int(after.get("status") or -99) == expected_status:
+            return after
+        time.sleep(1)
+    raise OAError(
+        f"审批请求已提交但回读校验失败：期望 status={expected_status}，实际 {after.get('status')}（{after.get('statusName')}）"
+    )
