@@ -5,7 +5,10 @@
 
 ## 一键启动
 
-双击项目根目录的 **`启动摩尚OA.command`**，会自动拉起本地后端并打开桌面窗口。
+- **应用程序 → 摩尚OA**（`/Applications/MoshangOA.app`，推荐）：启动器强制 `arch -arm64`（LaunchServices 可能用 Rosetta 跑脚本型 app，venv 原生库是 arm64），日志在 `/tmp/moshang_oa_app.log`
+- 或双击项目根目录的 **`启动摩尚OA.command`**
+
+两者都会自动拉起本地后端（端口 8017）并打开桌面窗口。
 
 开发模式：
 
