@@ -66,6 +66,36 @@ export function ApprovalDetail() {
     (conflictFindings.length === 0 || (conflictReviewed && conflictMemo.trim() !== "")) &&
     (!isRisk || riskReviewed);
 
+  // 依据预检结果代拟驳回理由，供合伙人直接采纳或修改
+  const buildRejectDraft = (): string => {
+    if (!review) return "";
+    const items: string[] = [];
+    review.completeness.missing.forEach((m) => items.push(`立案资料不完整，缺少「${m}」，请补齐后重新提交`));
+    review.conflict.blockers.forEach((b) => items.push(b));
+    if (review.conflict.blockers.length === 0) {
+      conflictFindings.forEach((f) =>
+        items.push(
+          `利益冲突线索未排除：「${f.matched_name}」在案件 ${f.case_no || f.case_id} 中为${f.relation}，请先完成利冲审查并出具结论`,
+        ),
+      );
+    }
+    review.duplicate_filing.blockers.forEach((b) => items.push(b));
+    if (review.duplicate_filing.blockers.length === 0) {
+      duplicateFindings.forEach((f) =>
+        items.push(
+          `与案件 ${f.case_no || f.case_id} 存在当事人/案由重叠（${[...f.principal_overlap, ...f.opponent_overlap].join("、")}），请说明是否重复立案或关联案件`,
+        ),
+      );
+    }
+    (review.fee_explanation?.blockers ?? []).forEach((b) => items.push(b));
+    if (isRisk && review.risk_charge.verdict === "issues_found") {
+      (review.risk_charge.issues ?? []).forEach((i) => items.push(i));
+    }
+    if (items.length === 0) return "";
+    const body = items.map((s, i) => `${i + 1}、${s}`).join("；\n");
+    return `经审查，本案暂不符合立案条件，予以驳回，请按以下意见补正后重新提交审批：\n${body}。`;
+  };
+
   const submit = async (action: "approve" | "reject") => {
     setSubmitting(true);
     setSubmitError([]);
@@ -86,6 +116,7 @@ export function ApprovalDetail() {
           ? `已通过：${result.case_no} 现为「${result.new_status_name}」`
           : `已驳回：${result.case_no} 现为「${result.new_status_name}」`,
       );
+      window.dispatchEvent(new Event("moshang:pending-refresh"));
     } catch (err) {
       if (err instanceof ApiError && err.gateErrors) setSubmitError(err.gateErrors);
       else setSubmitError([err instanceof Error ? err.message : String(err)]);
@@ -403,7 +434,7 @@ export function ApprovalDetail() {
         <footer className="flex items-center justify-end gap-3 border-t border-zinc-200 bg-white px-6 py-3.5">
           <button
             onClick={() => {
-              setMemo("");
+              setMemo(buildRejectDraft());
               setDialog("reject");
             }}
             className="rounded-lg border border-red-200 px-5 py-2 text-sm font-medium text-red-600 hover:bg-red-50"
@@ -451,14 +482,21 @@ export function ApprovalDetail() {
         title={`驳回 ${review.case_no || `#${review.lawcase_id}`}`}
         onClose={() => setDialog(null)}
       >
-        <p className="mb-3 text-sm text-zinc-500">驳回后案件状态将变为「立案未通过」，审批意见必填。</p>
+        <p className="mb-3 text-sm text-zinc-500">
+          驳回后案件状态将变为「立案未通过」，审批意见必填。
+          {memo.trim() !== "" && (
+            <span className="mt-1 block text-xs text-indigo-600">
+              已按预检发现的问题代拟驳回理由，可直接提交或修改后提交。
+            </span>
+          )}
+        </p>
         <textarea
           value={memo}
           onChange={(e) => setMemo(e.target.value)}
           placeholder="驳回理由（必填，将反馈给经办律师）"
-          rows={3}
+          rows={memo.split("\n").length > 3 ? 8 : 4}
           autoFocus
-          className="mb-4 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none focus:border-red-400"
+          className="mb-4 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm leading-relaxed outline-none focus:border-red-400"
         />
         <DialogActions
           confirmText={submitting ? "提交中…" : "确认驳回"}

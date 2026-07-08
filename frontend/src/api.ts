@@ -1,4 +1,12 @@
-import type { ApprovalReview, CaseListResponse, CaseRow, PendingResponse, User } from "./types";
+import type {
+  ApprovalReview,
+  AssistantJob,
+  AssistantOverview,
+  CaseListResponse,
+  CaseRow,
+  PendingResponse,
+  User,
+} from "./types";
 
 const SESSION_KEY = "moshang_session_id";
 const USER_KEY = "moshang_user";
@@ -112,5 +120,39 @@ export const api = {
 
   reject(id: number, memo: string): Promise<{ ok: boolean; case_no: string; new_status_name: string }> {
     return request(`/api/approvals/${id}/reject`, { method: "POST", body: JSON.stringify({ memo }) });
+  },
+
+  // ---------------------------------------------------------- 办案助手
+  assistantOverview(): Promise<AssistantOverview> {
+    return request("/api/assistant/overview");
+  },
+
+  assistantPick(mode: "files" | "folder"): Promise<{ paths: string[] }> {
+    return request("/api/assistant/pick", { method: "POST", body: JSON.stringify({ mode }) });
+  },
+
+  assistantConvert(paths: string[], engine: string): Promise<AssistantJob> {
+    return request("/api/assistant/convert", { method: "POST", body: JSON.stringify({ paths, engine }) });
+  },
+
+  assistantWechat(body: {
+    paths: string[];
+    interval: number;
+    smart_filter: boolean;
+    preserve_head_sec: number;
+  }): Promise<AssistantJob> {
+    return request("/api/assistant/wechat", { method: "POST", body: JSON.stringify(body) });
+  },
+
+  assistantOrganize(source: "ocr" | "wechat" | "custom", dir?: string): Promise<AssistantJob> {
+    return request("/api/assistant/organize", { method: "POST", body: JSON.stringify({ source, dir }) });
+  },
+
+  assistantJobs(): Promise<{ jobs: AssistantJob[] }> {
+    return request("/api/assistant/jobs");
+  },
+
+  assistantReveal(path: string): Promise<{ ok: boolean }> {
+    return request("/api/assistant/reveal", { method: "POST", body: JSON.stringify({ path }) });
   },
 };

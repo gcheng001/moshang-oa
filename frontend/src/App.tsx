@@ -7,6 +7,7 @@ import { Login } from "./pages/Login";
 import { CaseBoard } from "./pages/CaseBoard";
 import { Approvals } from "./pages/Approvals";
 import { ApprovalDetail } from "./pages/ApprovalDetail";
+import { Assistant } from "./pages/Assistant";
 
 export default function App() {
   const [user, setUser] = useState<User | null>(savedUser());
@@ -20,6 +21,7 @@ export default function App() {
             <Route path="/cases" element={<CaseBoard />} />
             <Route path="/approvals" element={<Approvals />} />
             <Route path="/approvals/:id" element={<ApprovalDetail />} />
+            <Route path="/assistant" element={<Assistant />} />
             <Route path="*" element={<Navigate to="/cases" replace />} />
           </Route>
         ) : (

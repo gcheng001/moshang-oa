@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { ClipboardCheck, LayoutGrid, LogOut, Scale } from "lucide-react";
+import { Briefcase, ClipboardCheck, LayoutGrid, LogOut, Scale } from "lucide-react";
 import { api } from "../api";
 import type { User } from "../types";
 
 const NAV = [
   { to: "/cases", label: "案件看板", icon: LayoutGrid },
   { to: "/approvals", label: "立案审批", icon: ClipboardCheck },
+  { to: "/assistant", label: "办案助手", icon: Briefcase },
 ];
 
 const SEEN_KEY = "moshang_seen_filing_ids";
@@ -55,7 +56,13 @@ export function Layout({ user, onLogout }: { user: User; onLogout: () => void })
   useEffect(() => {
     void poll();
     const timer = setInterval(() => void poll(), POLL_INTERVAL);
-    return () => clearInterval(timer);
+    // 审批通过/驳回后由 ApprovalDetail 广播，立即刷新角标，不等下个轮询周期
+    const onRefresh = () => void poll();
+    window.addEventListener("moshang:pending-refresh", onRefresh);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("moshang:pending-refresh", onRefresh);
+    };
   }, [poll]);
 
   // 进入审批页即视为已读，清除红点

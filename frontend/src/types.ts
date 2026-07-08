@@ -67,6 +67,29 @@ export interface DuplicateFinding {
   cause_match: boolean;
 }
 
+export interface AssistantOverview {
+  helper_app: boolean;
+  wechat_evidence: boolean;
+  python3: boolean;
+  engines: { mineru: boolean; visionocr: boolean; legalocr: boolean };
+  output_dir: string;
+  wechat_output_dir: string;
+}
+
+export interface AssistantJob {
+  id: string;
+  kind: "convert" | "wechat" | "organize";
+  title: string;
+  status: "running" | "done" | "failed";
+  detail: string;
+  created_at: string;
+  finished_at: string | null;
+  inputs: string[];
+  outputs: string[];
+  log_tail: string;
+  error: string | null;
+}
+
 export interface ApprovalReview {
   lawcase_id: number;
   case_no: string | null;

@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import oa, sessions
+from . import assistant, oa, sessions
 
 DEFAULT_BASE_URL = os.environ.get("MOSHANG_OA_BASE_URL", oa.DEFAULT_BASE_URL)
 
@@ -239,6 +239,89 @@ def api_reject(
         "new_status": after.get("status"),
         "new_status_name": after.get("statusName"),
     }
+
+
+# ------------------------------------------------------------ 办案助手（本机能力，不触碰 OA）
+
+
+class PickBody(BaseModel):
+    mode: str = "files"  # files | folder
+
+
+class ConvertBody(BaseModel):
+    paths: list[str]
+    engine: str = "mineru"
+
+
+class WechatBody(BaseModel):
+    paths: list[str]
+    interval: float = 1.0
+    smart_filter: bool = False
+    preserve_head_sec: float = 8.0
+
+
+class OrganizeBody(BaseModel):
+    source: str = "ocr"  # ocr | wechat | custom
+    dir: str | None = None
+
+
+class RevealBody(BaseModel):
+    path: str
+
+
+@app.get("/api/assistant/overview")
+def api_assistant_overview(session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    return assistant.tool_status()
+
+
+@app.post("/api/assistant/pick")
+def api_assistant_pick(body: PickBody, session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    return {"paths": assistant.pick_paths(body.mode)}
+
+
+@app.post("/api/assistant/convert")
+def api_assistant_convert(body: ConvertBody, session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    if not body.paths:
+        raise HTTPException(status_code=422, detail="请先选择文件")
+    if body.engine not in assistant.ENGINES:
+        raise HTTPException(status_code=422, detail=f"未知引擎：{body.engine}")
+    return assistant.start_convert(body.paths, body.engine)
+
+
+@app.post("/api/assistant/wechat")
+def api_assistant_wechat(body: WechatBody, session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    if not body.paths:
+        raise HTTPException(status_code=422, detail="请先选择录屏视频")
+    if not (0.2 <= body.interval <= 60):
+        raise HTTPException(status_code=422, detail="截图间隔须在 0.2~60 秒之间")
+    return assistant.start_wechat(body.paths, body.interval, body.smart_filter, body.preserve_head_sec)
+
+
+@app.post("/api/assistant/organize")
+def api_assistant_organize(body: OrganizeBody, session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    if body.source == "custom" and not (body.dir or "").strip():
+        raise HTTPException(status_code=422, detail="请选择要整理的目录")
+    return assistant.start_organize(body.source, body.dir)
+
+
+@app.get("/api/assistant/jobs")
+def api_assistant_jobs(session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    return {"jobs": assistant.list_jobs()}
+
+
+@app.get("/api/assistant/jobs/{job_id}")
+def api_assistant_job(job_id: str, session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    job = assistant.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return job
+
+
+@app.post("/api/assistant/reveal")
+def api_assistant_reveal(body: RevealBody, session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    if not assistant.reveal(body.path):
+        raise HTTPException(status_code=404, detail="文件或目录不存在")
+    return {"ok": True}
 
 
 # ------------------------------------------------------------- static SPA
