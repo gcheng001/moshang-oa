@@ -1,12 +1,12 @@
-# 摩尚OA v2 — 律师事务所办公系统
+# 办公助手（摩尚OA v2）— 律师事务所办公系统
 
-> 全新重写版（2026-07-08）：React 前端 + FastAPI 本地后端 + pywebview 桌面壳。
+> 全新重写版（2026-07-08）：React 前端 + FastAPI 本地后端 + pywebview 桌面壳。应用名「办公助手」，项目目录沿用 `摩尚OA`。
 > 领域术语见 `CONTEXT.md`，技术决策见 `docs/adr/`。旧版 Tauri 代码已于 2026-07-08 清理（如需找回：废纸篓 `摩尚OA_legacy_20260708`）。
 
 ## 一键启动
 
-- **应用程序 → 摩尚OA**（`/Applications/MoshangOA.app`，推荐）：启动器强制 `arch -arm64`（LaunchServices 可能用 Rosetta 跑脚本型 app，venv 原生库是 arm64），日志在 `/tmp/moshang_oa_app.log`
-- 或双击项目根目录的 **`启动摩尚OA.command`**
+- **应用程序 → 办公助手**（`/Applications/办公助手.app`，推荐）：启动器强制 `arch -arm64`（LaunchServices 可能用 Rosetta 跑脚本型 app，venv 原生库是 arm64），日志在 `/tmp/moshang_oa_app.log`，图标源文件在 `docs/appicon/`
+- 或双击项目根目录的 **`启动办公助手.command`**
 
 两者都会自动拉起本地后端（端口 8017）并打开桌面窗口。
 
@@ -37,7 +37,7 @@ cd frontend && npm run build
 ## 架构
 
 ```
-启动摩尚OA.command
+启动办公助手.command
 └── backend/desktop.py          # pywebview 桌面窗口 + 拉起 uvicorn
     └── backend/app/            # FastAPI
         ├── main.py             # REST API + 托管 frontend/dist

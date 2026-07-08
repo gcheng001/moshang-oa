@@ -43,13 +43,15 @@ def main() -> None:
         threading.Thread(target=run_server, daemon=True).start()
     wait_ready()
     webview.create_window(
-        "摩尚OA",
+        "办公助手",
         f"http://{HOST}:{PORT}/",
         width=1360,
         height=860,
         min_size=(1024, 640),
     )
-    webview.start()
+    # private_mode=False：WKWebView 用持久化数据仓，否则 localStorage 每次启动清空，
+    # 「记住 API Key」无法生效
+    webview.start(private_mode=False)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -20,18 +22,23 @@ from pathlib import Path
 
 # ------------------------------------------------------------------ 工具路径
 
+# HOME 可能被启动环境（沙盒/代理 shell）重定向到临时目录，droplet.sh 及各 CLI
+# 依赖 $HOME 定位 ~/.local/bin 和桌面输出目录，必须钉死为真实用户目录。
+REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+SUBPROC_ENV = {**os.environ, "HOME": str(REAL_HOME)}
+
 HELPER_APP = Path("/Applications/办案工具集/办案材料助手.app")
 DROPLET_SH = HELPER_APP / "Contents" / "MacOS" / "droplet.sh"
 WECHAT_CLI = HELPER_APP / "Contents" / "Resources" / "wechat_evidence.py"
 PY = "/opt/homebrew/bin/python3"
 
-LOCAL_BIN = Path.home() / ".local" / "bin"
+LOCAL_BIN = REAL_HOME / ".local" / "bin"
 VISION_OCR_PDF = LOCAL_BIN / "vision-ocr-pdf"
 MINERU_CLI = LOCAL_BIN / "mineru-local"
 LEGAL_OCR_CLI = LOCAL_BIN / "legal-ocr-convert"
 
-OUTPUT_DIR = Path.home() / "Desktop" / "VisionOCR_Output"
-WECHAT_OUTPUT_DIR = Path.home() / "Desktop" / "录屏取证输出"
+OUTPUT_DIR = REAL_HOME / "Desktop" / "VisionOCR_Output"
+WECHAT_OUTPUT_DIR = REAL_HOME / "Desktop" / "录屏取证输出"
 
 ENGINES = ["mineru", "visionocr", "legalocr", "legalocr-paddle", "legalocr-mineru"]
 
@@ -120,7 +127,7 @@ def get_job(job_id: str) -> dict | None:
 
 
 def _run_logged(job: dict, cmd: list[str]) -> subprocess.CompletedProcess:
-    proc = subprocess.run(cmd, text=True, capture_output=True)
+    proc = subprocess.run(cmd, text=True, capture_output=True, env=SUBPROC_ENV)
     log = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
     _update(job, log_tail=log[-_LOG_LIMIT:])
     return proc
@@ -339,7 +346,7 @@ def _ensure_wechat_ocr(job: dict, source_dir: Path) -> str:
         return ""
     _update(job, detail="正在整理取证PDF截图 OCR…")
     cmd = [PY, str(WECHAT_CLI), "ocr-index", str(source_dir), "--scope", "selected", "--jobs", "2"]
-    proc = subprocess.run(cmd, text=True, capture_output=True)
+    proc = subprocess.run(cmd, text=True, capture_output=True, env=SUBPROC_ENV)
     if proc.returncode != 0:
         return (proc.stderr or proc.stdout or "录屏取证 OCR 失败").strip()[:500]
     missing = [path.name for path in paths.values() if not path.exists()]
@@ -375,7 +382,7 @@ def _ensure_pdf_markdown(job: dict, source_dir: Path, evidence_dir: Path, materi
     out = auto_dir / f"{pdf.stem}.md"
     if not out.exists():
         _update(job, detail=f"正在将取证PDF补转 Markdown：{pdf.name}")
-        proc = subprocess.run([PY, str(VISION_OCR_PDF), str(pdf), "--output", str(out)], text=True, capture_output=True)
+        proc = subprocess.run([PY, str(VISION_OCR_PDF), str(pdf), "--output", str(out)], text=True, capture_output=True, env=SUBPROC_ENV)
         if proc.returncode != 0 or not out.exists():
             return materials, (proc.stderr or proc.stdout or "PDF 补转 Markdown 失败").strip()[:500]
     auto_record = _material_record(out, source_dir)

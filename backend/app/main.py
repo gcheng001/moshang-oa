@@ -22,7 +22,7 @@ from . import assistant, oa, sessions
 
 DEFAULT_BASE_URL = os.environ.get("MOSHANG_OA_BASE_URL", oa.DEFAULT_BASE_URL)
 
-app = FastAPI(title="摩尚OA", docs_url=None, redoc_url=None)
+app = FastAPI(title="办公助手", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,

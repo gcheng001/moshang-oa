@@ -42,7 +42,7 @@ export function Login({ onLogin }: { onLogin: (user: User) => void }) {
           <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-indigo-600 shadow-lg shadow-indigo-600/20">
             <Scale className="h-6 w-6 text-white" strokeWidth={2.2} />
           </div>
-          <h1 className="text-lg font-semibold">摩尚OA</h1>
+          <h1 className="text-lg font-semibold">办公助手</h1>
           <p className="text-xs text-zinc-400">浙江摩尚律师事务所 · 办公系统</p>
         </div>
 

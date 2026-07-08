@@ -84,7 +84,7 @@ export function Layout({ user, onLogout }: { user: User; onLogout: () => void })
             <Scale className="h-4.5 w-4.5 text-white" strokeWidth={2.2} />
           </div>
           <div>
-            <div className="text-sm font-semibold leading-tight">摩尚OA</div>
+            <div className="text-sm font-semibold leading-tight">办公助手</div>
             <div className="text-[11px] text-zinc-400">律师事务所</div>
           </div>
         </div>
