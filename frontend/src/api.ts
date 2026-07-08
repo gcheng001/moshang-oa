@@ -10,6 +10,7 @@ import type {
 
 const SESSION_KEY = "moshang_session_id";
 const USER_KEY = "moshang_user";
+const APIKEY_MEMO = "moshang_apikey_memo";
 
 export function savedUser(): User | null {
   const raw = localStorage.getItem(USER_KEY);
@@ -37,7 +38,30 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// 后端会话是内存态，APP 重开后旧 session 必然失效；
+// 若本机记住了 API Key，则在 401 时静默重登一次并重试原请求。
+let reloginPromise: Promise<boolean> | null = null;
+
+async function silentRelogin(): Promise<boolean> {
+  const apikey = localStorage.getItem(APIKEY_MEMO);
+  if (!apikey) return false;
+  try {
+    const resp = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apikey }),
+    });
+    if (!resp.ok) return false;
+    const data = (await resp.json()) as { session_id: string; user: User };
+    localStorage.setItem(SESSION_KEY, data.session_id);
+    localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(init?.headers as Record<string, string> | undefined),
@@ -47,6 +71,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   const resp = await fetch(path, { ...init, headers });
   if (!resp.ok) {
+    if (resp.status === 401 && !retried && path !== "/api/login" && path !== "/api/logout") {
+      if (!reloginPromise) {
+        reloginPromise = silentRelogin().finally(() => {
+          reloginPromise = null;
+        });
+      }
+      if (await reloginPromise) return request<T>(path, init, true);
+      clearSession();
+      if (!window.location.hash.startsWith("#/login")) {
+        window.location.hash = "#/login";
+        window.location.reload();
+      }
+    }
     let message = `请求失败（${resp.status}）`;
     let gateErrors: string[] | null = null;
     try {

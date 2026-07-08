@@ -5,7 +5,7 @@
 
 ## 一键启动
 
-- **应用程序 → 办公助手**（`/Applications/办公助手.app`，推荐）：启动器强制 `arch -arm64`（LaunchServices 可能用 Rosetta 跑脚本型 app，venv 原生库是 arm64），日志在 `/tmp/moshang_oa_app.log`，图标源文件在 `docs/appicon/`
+- **应用程序 → 办案工具集 → 办公助手**（`/Applications/办案工具集/办公助手.app`，推荐）：启动器强制 `arch -arm64`（LaunchServices 可能用 Rosetta 跑脚本型 app，venv 原生库是 arm64），日志在 `/tmp/moshang_oa_app.log`，图标源文件在 `docs/appicon/`
 - 或双击项目根目录的 **`启动办公助手.command`**
 
 两者都会自动拉起本地后端（端口 8017）并打开桌面窗口。
