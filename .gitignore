@@ -8,9 +8,15 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
 dist-ssr
 *.local
+
+# 前端产物 frontend/dist 特意入库（Windows 端免装 Node 直接可跑），不要忽略
+# Windows 侧的下载缓存/运行时/打包产物不入库
+windows/cache/
+windows/runtime/
+windows/dist/
+edge-profile/
 
 # Python
 .venv

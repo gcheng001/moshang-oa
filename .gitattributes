@@ -1,0 +1,3 @@
+# .bat 必须保持 CRLF 原样进出（Mac 上提交、Windows 上检出/下载 ZIP 都不许改写），
+# 否则 cmd 解析 LF 批处理会出现"双击没反应"
+*.bat -text
