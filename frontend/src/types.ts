@@ -67,6 +67,34 @@ export interface DuplicateFinding {
   cause_match: boolean;
 }
 
+export interface DocTemplate {
+  name: string;
+  isSelected: boolean;
+}
+
+export interface DocTemplatesResponse {
+  case_no: string | null;
+  templates: DocTemplate[];
+  principal_legal_persons: string[];
+  principal_orgs: string[];
+}
+
+export interface DocDownloadSaved {
+  template: string;
+  path: string;
+  size: number;
+  valid_docx: boolean;
+  auto_added: boolean;
+}
+
+export interface DocDownloadResponse {
+  ok: boolean;
+  case_no: string;
+  dir: string;
+  saved: DocDownloadSaved[];
+  notes: string[];
+}
+
 export interface AssistantOverview {
   helper_app: boolean;
   wechat_evidence: boolean;
@@ -96,6 +124,14 @@ export interface ApprovalReview {
   status: number;
   status_name: string;
   completeness: { result: string; missing: string[]; warnings: string[] };
+  cause: {
+    result: string;
+    cause_text: string | null;
+    matches?: { id: number | null; name: string; is_leaf: boolean; is_root: boolean; path: string }[];
+    blockers?: string[];
+    warnings?: string[];
+    suggestions?: string[];
+  };
   conflict: {
     result: string;
     principals: string[];

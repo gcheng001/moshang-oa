@@ -30,9 +30,9 @@ export function Approvals() {
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b border-zinc-200 bg-white px-6 py-4">
         <div>
-          <h2 className="text-base font-semibold">立案审批</h2>
+          <h2 className="text-base font-semibold">案件审批</h2>
           <p className="text-xs text-zinc-400">
-            立案待审 {data?.filing.length ?? "…"} 件 · 结案待审 {data?.closing.length ?? "…"} 件
+            立案待审 {data?.filing.length ?? "…"} 件（可在本页审批） · 结案待审 {data?.closing.length ?? "…"} 件（只读）
           </p>
         </div>
         <button
@@ -107,9 +107,16 @@ function PendingCard({ row, actionable = false }: { row: CaseRow; actionable?: b
           <span className="text-xs text-zinc-400">{row.baseTypeName}</span>
         </div>
         <div className="truncate text-sm text-zinc-600">
-          {row.wtrNames || row.dsrNames || "—"} <span className="text-zinc-300">诉</span> {row.tosNames || "—"}
+          {row.wtrNames || row.dsrNames || "—"}
+          {row.tosNames && (
+            <>
+              {" "}
+              <span className="text-zinc-300">{row.baseTypeName?.includes("刑事") ? "·" : "诉"}</span>{" "}
+              {row.tosNames}
+            </>
+          )}
           <span className="mx-2 text-zinc-300">·</span>
-          {row.causeAction || "（无案由）"}
+          {row.causeAction || row.caseHeadName || "（无案由）"}
         </div>
         <div className="mt-1 text-xs text-zinc-400">
           经办：{row.empNames || "—"}

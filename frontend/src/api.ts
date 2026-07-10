@@ -4,6 +4,8 @@ import type {
   AssistantOverview,
   CaseListResponse,
   CaseRow,
+  DocDownloadResponse,
+  DocTemplatesResponse,
   PendingResponse,
   User,
 } from "./types";
@@ -132,6 +134,17 @@ export const api = {
 
   caseDetail(id: number): Promise<CaseRow & Record<string, unknown>> {
     return request(`/api/cases/${id}`);
+  },
+
+  caseDocTemplates(id: number): Promise<DocTemplatesResponse> {
+    return request(`/api/cases/${id}/documents/templates`);
+  },
+
+  caseDocDownload(id: number, templates: string[]): Promise<DocDownloadResponse> {
+    return request(`/api/cases/${id}/documents/download`, {
+      method: "POST",
+      body: JSON.stringify({ templates }),
+    });
   },
 
   pending(): Promise<PendingResponse> {

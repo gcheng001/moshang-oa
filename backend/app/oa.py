@@ -13,14 +13,18 @@ import time
 import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 import requests
 
 DEFAULT_BASE_URL = "https://moshang2.ycq6.com"
 
-ACTIVE_CASE_STATUSES = {-1, 0, 1, 3, 4}
-ACTIVE_DUPLICATE_STATUSES = {1, 2, 3, 4, 5}
+# 利冲严重度用：案件仍处于活动/待定状态（-2撤销被驳回、-1撤销审核中、0草稿、
+# 1立案待审、3办理中、4结案待审、5结案未通过均视为在办）
+ACTIVE_CASE_STATUSES = {-2, -1, 0, 1, 3, 4, 5}
+# 重复立案硬阻断用：仅在办/待处理状态。2「立案未通过」不算——驳回后重新申报
+# 不应被旧记录永久阻断，降级为人工复核提示
+ACTIVE_DUPLICATE_STATUSES = {1, 3, 4, 5}
 RISK_CHARGE_METHOD_ID = 5
 RISK_PROHIBITED_KEYWORDS = (
     "刑事",
@@ -55,10 +59,15 @@ class OAError(RuntimeError):
 
 # ---------------------------------------------------------------- transport
 
+# OA 是国内直连站点，本机常驻代理（如 127.0.0.1:7897）会掐断其 TLS 握手（SSL EOF）；
+# APP 可能从带 https_proxy 环境变量的 shell 被拉起——OA 请求一律直连，忽略代理环境。
+_http = requests.Session()
+_http.trust_env = False
+
 
 def login(base_url: str, api_key: str) -> str:
     url = urljoin(base_url.rstrip("/") + "/", "DataServices/AgentAPI/Login")
-    resp = requests.get(url, params={"apikey": api_key}, timeout=30)
+    resp = _http.get(url, params={"apikey": api_key}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     token = ((data or {}).get("data") or {}).get("token")
@@ -69,14 +78,14 @@ def login(base_url: str, api_key: str) -> str:
 
 def agent_get(base_url: str, token: str, action: str, params: dict[str, Any] | None = None) -> Any:
     url = urljoin(base_url.rstrip("/") + "/", f"DataServices/AgentAPI/{action}")
-    resp = requests.get(url, headers={"nedev_access_token": token}, params=params or {}, timeout=30)
+    resp = _http.get(url, headers={"nedev_access_token": token}, params=params or {}, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def post_form(base_url: str, token: str, path: str, form: dict[str, str]) -> Any:
     url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
-    resp = requests.post(url, headers={"nedev_access_token": token}, data=form, timeout=30)
+    resp = _http.post(url, headers={"nedev_access_token": token}, data=form, timeout=30)
     resp.raise_for_status()
     try:
         return resp.json()
@@ -289,6 +298,158 @@ def row_status(row: dict[str, Any]) -> int | None:
         return None
 
 
+# ------------------------------------------------------- case head dictionary
+# OA 自带案由/罪名字典（GetCaseHeads 无参返回全量 12 棵树约 2009 节点，2026-07-10 实测；
+# 早前 skill 记录「民事细分为空」已过时）。立案审批要求案由必须命中本字典。
+
+CASE_HEADS_TTL_SECONDS = 12 * 3600
+_case_heads_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def get_case_heads(base_url: str, token: str) -> list[dict[str, Any]]:
+    cached = _case_heads_cache.get(base_url)
+    if cached and time.time() - cached[0] < CASE_HEADS_TTL_SECONDS:
+        return cached[1]
+    payload = response_data(agent_get(base_url, token, "GetCaseHeads"))
+    if not isinstance(payload, list) or not payload:
+        raise OAError(f"GetCaseHeads 返回异常：{payload!r}")
+    heads = [row for row in payload if isinstance(row, dict) and str(row.get("name") or "").strip()]
+    _case_heads_cache[base_url] = (time.time(), heads)
+    return heads
+
+
+def _case_head_path(head: dict[str, Any], by_id: dict[int, dict[str, Any]]) -> str:
+    names = []
+    for part in str(head.get("nodePath") or "").split("."):
+        try:
+            node = by_id.get(int(part))
+        except ValueError:
+            continue
+        if node:
+            names.append(str(node.get("name")))
+    return " > ".join(names) if names else str(head.get("name"))
+
+
+def _match_case_head(
+    cause_norm: str, heads: list[dict[str, Any]], base_type: str
+) -> dict[str, Any] | None:
+    candidates = [h for h in heads if normalize_name(str(h.get("name"))) == cause_norm]
+    if not candidates:
+        return None
+    by_id = {int(h["id"]): h for h in heads if h.get("id") is not None}
+
+    def root_name(head: dict[str, Any]) -> str:
+        first = str(head.get("nodePath") or "").split(".")[0]
+        try:
+            node = by_id.get(int(first))
+        except ValueError:
+            node = None
+        return str(node.get("name")) if node else ""
+
+    def rank(head: dict[str, Any]) -> tuple[int, int]:
+        root = root_name(head)
+        # 同名节点在多棵树中出现时，优先与案件类型同树、优先叶子节点
+        type_match = 0
+        if "刑事" in base_type and "刑事" in root:
+            type_match = -1
+        elif "民事" in base_type and "民事" in root:
+            type_match = -1
+        return (type_match, 0 if head.get("isLeaf") else 1)
+
+    best = sorted(candidates, key=rank)[0]
+    return {
+        "id": best.get("id"),
+        "name": str(best.get("name")),
+        "is_leaf": bool(best.get("isLeaf")),
+        "is_root": best.get("parentId") is None,
+        "path": _case_head_path(best, by_id),
+    }
+
+
+# 相似度计算时剔除的通用字，避免仅靠「纠纷/罪」等后缀凑出无意义建议
+_SUGGESTION_STOP_CHARS = set("纠纷罪案件")
+
+
+def _cause_suggestions(cause_norm: str, heads: list[dict[str, Any]], limit: int = 5) -> list[str]:
+    core = set(cause_norm) - _SUGGESTION_STOP_CHARS
+    scored: list[tuple[int, int, str]] = []
+    for head in heads:
+        name = str(head.get("name"))
+        norm = normalize_name(name)
+        if not norm:
+            continue
+        if cause_norm in norm or norm in cause_norm:
+            scored.append((0, abs(len(norm) - len(cause_norm)), name))
+        elif core:
+            common = len((set(norm) - _SUGGESTION_STOP_CHARS) & core)
+            if common >= max(2, len(core) // 2):
+                scored.append((1, -common, name))
+    scored.sort()
+    seen: set[str] = set()
+    out: list[str] = []
+    for _, _, name in scored:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def cause_review(base_url: str, token: str, detail: dict[str, Any]) -> dict[str, Any]:
+    """案由规范性审查：案由/罪名必须命中 OA 系统案由字典，自由填写文本阻断。"""
+    cause_text = str(detail.get("causeAction") or detail.get("caseHeadName") or "").strip()
+    head_name = str(detail.get("caseHeadName") or "").strip()
+    if not cause_text:
+        # 案由缺失由资料完整性阻断，此处不重复报
+        return {"result": "not_applicable", "cause_text": None}
+
+    heads = get_case_heads(base_url, token)
+    base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    matches: list[dict[str, Any]] = []
+    suggestions: list[str] = []
+
+    # 整串精确匹配优先（罪名本身可含顿号，如「拒不执行判决、裁定罪」），
+    # 不命中时再按分隔符拆分逐一匹配（多案由登记场景）
+    whole = _match_case_head(normalize_name(cause_text), heads, base_type)
+    parts = [cause_text] if whole else split_names(cause_text)
+    for part in parts:
+        norm = normalize_name(part)
+        match = whole if whole else _match_case_head(norm, heads, base_type)
+        if match is None:
+            suggestions.extend(s for s in _cause_suggestions(norm, heads) if s not in suggestions)
+            blockers.append(
+                f"案由「{part}」不在 OA 系统案由库中，疑似手工自由填写；"
+                "请在 OA 中改选系统案由后重新提交审批"
+            )
+        elif match["is_root"]:
+            blockers.append(
+                f"案由「{part}」是案由库的顶级分类节点，不能作为具体案由使用，请选择下级具体案由"
+            )
+            matches.append(match)
+        else:
+            if not match["is_leaf"]:
+                warnings.append(
+                    f"「{match['name']}」在案由库中还有更细分的下级案由，如适用可选更具体的（不影响通过）"
+                )
+            matches.append(match)
+
+    if not blockers and head_name and normalize_name(head_name) != normalize_name(cause_text):
+        warnings.append(f"登记案由「{cause_text}」与字典关联案由「{head_name}」不一致，请核实以哪个为准")
+
+    return {
+        "result": "blocked" if blockers else "ok",
+        "cause_text": cause_text,
+        "matches": matches,
+        "blockers": blockers,
+        "warnings": warnings,
+        "suggestions": suggestions,
+    }
+
+
 # ------------------------------------------------------- approval reviews
 
 
@@ -437,10 +598,17 @@ def duplicate_filing_review(base_url: str, token: str, detail: dict[str, Any], l
         cause_match = bool(current_cause and row_cause and current_cause == row_cause)
         status = row_status(row)
 
-        if principal_overlap and opponent_overlap and cause_match and status in ACTIVE_DUPLICATE_STATUSES:
+        exact_triple = bool(principal_overlap and opponent_overlap and cause_match)
+        if exact_triple and status in ACTIVE_DUPLICATE_STATUSES:
             severity = "block"
             relation = "同委托人+同对方+同案由的OA在办/待处理案件"
             blockers.append(f"OA内疑似重复立案: {row.get('no') or row.get('preNo') or row_id} {relation}")
+        elif exact_triple and status == 2:
+            severity = "review"
+            relation = "同委托人+同对方+同案由的历史「立案未通过」记录，可能为驳回后重新申报，请核对前次驳回问题是否已补正"
+        elif exact_triple:
+            severity = "review"
+            relation = "同委托人+同对方+同案由的历史案件（已结案/已撤销/已归档），请判断是否为新阶段立案"
         elif (cause_match and any_party_overlap) or (principal_overlap and opponent_overlap):
             severity = "review"
             relation = "部分当事人/案由重叠，需合伙人判断是否关联或重复"
@@ -609,6 +777,7 @@ def build_approval_review(
         "status": detail.get("status"),
         "status_name": detail.get("statusName"),
         "completeness": completeness_review(detail, entity),
+        "cause": cause_review(base_url, token, detail),
         "conflict": conflict_review(base_url, token, detail, lawcase_id),
         "duplicate_filing": duplicate_filing_review(base_url, token, detail, lawcase_id),
         "fee_explanation": fee_explanation_review(detail, entity),
@@ -624,6 +793,7 @@ def approval_gate_errors(
     risk_reviewed: bool = False,
 ) -> list[str]:
     errors = [f"资料不完整: {v}" for v in (review["completeness"].get("missing") or [])]
+    errors.extend(review.get("cause", {}).get("blockers") or [])
     errors.extend(review["conflict"].get("blockers") or [])
     findings = review["conflict"].get("findings") or []
     if findings and not (conflict_reviewed and conflict_memo.strip()):
@@ -659,9 +829,122 @@ def verify_status_change(base_url: str, token: str, lawcase_id: int, expected_st
     after: dict[str, Any] = {}
     for _ in range(5):
         after = get_case_detail(base_url, token, lawcase_id)
-        if int(after.get("status") or -99) == expected_status:
+        if row_status(after) == expected_status:
             return after
         time.sleep(1)
     raise OAError(
         f"审批请求已提交但回读校验失败：期望 status={expected_status}，实际 {after.get('status')}（{after.get('statusName')}）"
     )
+
+
+# ------------------------------------------------------------- documents
+# 链路（skill 侧 2026-06-17 案件 3898 实测验证）：
+# GetWordTemplates → ExportWordTemplates → 带 token GET downloadUrl
+
+DOC_DOWNLOAD_TIMEOUT = 120
+
+_ORG_NAME_RE = re.compile(r"(分公司|办事处|合伙企业|合伙)$")
+_LEGAL_PERSON_NAME_RE = re.compile(r"(公司|集团|银行|医院|学校|合作社|事务所|研究院|保险)$")
+
+
+def get_word_templates(base_url: str, token: str, lawcase_id: int) -> list[dict[str, Any]]:
+    payload = response_data(agent_get(base_url, token, "GetWordTemplates", {"lawcaseId": lawcase_id}))
+    if not isinstance(payload, list):
+        raise OAError(f"GetWordTemplates 返回异常：{payload!r}")
+    return [row for row in payload if isinstance(row, dict)]
+
+
+def export_word_template(
+    base_url: str, token: str, lawcase_id: int, template_name: str
+) -> tuple[bytes, str | None]:
+    """导出单个文书模板并下载，返回 (文件字节, OA 提供的文件名或 None)。"""
+    payload = response_data(
+        agent_get(
+            base_url,
+            token,
+            "ExportWordTemplates",
+            {"lawcaseId": lawcase_id, "fileTemplateNames": template_name},
+        )
+    )
+    download_url = payload.get("downloadUrl") if isinstance(payload, dict) else None
+    if not download_url:
+        raise OAError(f"ExportWordTemplates 未返回下载地址：{payload!r}")
+    url = str(download_url)
+    if not url.lower().startswith("http"):
+        url = urljoin(base_url.rstrip("/") + "/", url.lstrip("/"))
+    resp = _http.get(url, headers={"nedev_access_token": token}, timeout=DOC_DOWNLOAD_TIMEOUT)
+    resp.raise_for_status()
+    filename = None
+    disposition = resp.headers.get("Content-Disposition") or ""
+    match = re.search(r"filename\*=UTF-8''([^;]+)", disposition, re.IGNORECASE)
+    if match:
+        filename = unquote(match.group(1))
+    else:
+        match = re.search(r'filename="?([^";]+)"?', disposition)
+        if match:
+            filename = match.group(1)
+    return resp.content, filename
+
+
+def principal_org_kinds(detail: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """识别委托人中的法人与非法人组织，优先看 identityTypeName，缺失时按名称兜底。"""
+    legal_persons: list[str] = []
+    orgs: list[str] = []
+    for row in detail.get("clients") or []:
+        if not isinstance(row, dict) or row.get("roleType") != 0:
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        identity = str(row.get("identityTypeName") or "")
+        if "非法人" in identity or "其他组织" in identity:
+            orgs.append(name)
+        elif "法人" in identity:
+            legal_persons.append(name)
+        elif _ORG_NAME_RE.search(name):
+            orgs.append(name)
+        elif _LEGAL_PERSON_NAME_RE.search(name):
+            legal_persons.append(name)
+    return legal_persons, orgs
+
+
+def companion_documents(
+    detail: dict[str, Any], available: list[str], selected: list[str]
+) -> tuple[list[str], list[str]]:
+    """委托类文书的必带证明书（2026-06-17 硬规则）：
+
+    委托人为法人 → 必须附带法定代表（人）身份证明书；
+    委托人为非法人组织 → 附带负责人证明书。
+    返回 (需自动追加的模板名, 说明文字)。
+    """
+    if not any("委托" in name for name in selected):
+        return [], []
+    legal_persons, orgs = principal_org_kinds(detail)
+    additions: list[str] = []
+    notes: list[str] = []
+
+    def find_template(*keywords: str) -> str | None:
+        for name in available:
+            if any(kw in name for kw in keywords):
+                return name
+        return None
+
+    if legal_persons:
+        target = find_template("法定代表身份证明", "法定代表人身份证明", "法人代表证明")
+        if target and target not in selected:
+            additions.append(target)
+            notes.append(f"委托人 {'、'.join(legal_persons)} 为法人，已自动附带《{target}》")
+        elif not target:
+            notes.append(
+                f"委托人 {'、'.join(legal_persons)} 为法人，但本案模板列表中未找到法定代表人身份证明文书，请人工核对补充"
+            )
+    if orgs:
+        target = find_template("负责人证明")
+        if target and target not in selected and target not in additions:
+            additions.append(target)
+            notes.append(f"委托人 {'、'.join(orgs)} 为非法人组织，已自动附带《{target}》")
+        elif not target:
+            notes.append(
+                f"委托人 {'、'.join(orgs)} 为非法人组织，但本案模板列表中未找到负责人证明书，请人工核对补充"
+            )
+    return additions, notes

@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import pwd
 import re
 import shutil
 import subprocess
@@ -20,11 +19,19 @@ import time
 import uuid
 from pathlib import Path
 
+IS_WINDOWS = os.name == "nt"
+
 # ------------------------------------------------------------------ 工具路径
 
 # HOME 可能被启动环境（沙盒/代理 shell）重定向到临时目录，droplet.sh 及各 CLI
 # 依赖 $HOME 定位 ~/.local/bin 和桌面输出目录，必须钉死为真实用户目录。
-REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+# Windows 无 pwd 模块，用 USERPROFILE；办案助手的 CLI 工具链仅 macOS 可用。
+if IS_WINDOWS:
+    REAL_HOME = Path(os.environ.get("USERPROFILE") or str(Path.home()))
+else:
+    import pwd
+
+    REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 SUBPROC_ENV = {**os.environ, "HOME": str(REAL_HOME)}
 
 HELPER_APP = Path("/Applications/办案工具集/办案材料助手.app")
@@ -607,6 +614,9 @@ return POSIX path of f
 
 
 def pick_paths(mode: str) -> list[str]:
+    if IS_WINDOWS:
+        # 办案助手工具链（droplet.sh 等）仅 macOS 可用，Windows 端不提供选择对话框
+        return []
     script = _PICK_FOLDER_SCRIPT if mode == "folder" else _PICK_FILES_SCRIPT
     try:
         proc = subprocess.run(["osascript", "-"], input=script, text=True, capture_output=True, timeout=600)
@@ -619,10 +629,16 @@ def pick_paths(mode: str) -> list[str]:
 
 def reveal(path: str) -> bool:
     target = Path(path).expanduser()
+    if not target.exists():
+        return False
+    if IS_WINDOWS:
+        if target.is_dir():
+            os.startfile(str(target))  # type: ignore[attr-defined]  # noqa: S606
+        else:
+            subprocess.run(["explorer", f"/select,{target}"], check=False)
+        return True
     if target.is_dir():
         subprocess.run(["open", str(target)], check=False)
-        return True
-    if target.is_file():
+    else:
         subprocess.run(["open", "-R", str(target)], check=False)
-        return True
-    return False
+    return True

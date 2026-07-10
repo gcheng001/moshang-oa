@@ -8,6 +8,8 @@ frontend static files. Write operations are limited to filing approval
 from __future__ import annotations
 
 import os
+import re
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +132,100 @@ def api_case_detail(
     return oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
 
 
+# ------------------------------------------------------------- documents
+
+# HOME 可能被启动环境重定向（同 assistant.REAL_HOME 的坑），文书固定落真实桌面
+DOC_DOWNLOAD_ROOT = assistant.REAL_HOME / "Desktop" / "文书下载"
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"|?*\\/]')
+
+
+def _safe_filename(name: str) -> str:
+    return _ILLEGAL_FILENAME_CHARS.sub("", name).strip() or "未命名"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    for i in range(2, 100):
+        candidate = path.with_name(f"{stem}-{i}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(status_code=500, detail=f"同名文件过多，无法保存：{path.name}")
+
+
+class DocDownloadBody(BaseModel):
+    templates: list[str]
+
+
+@app.get("/api/cases/{lawcase_id}/documents/templates")
+def api_case_doc_templates(
+    lawcase_id: int,
+    session: sessions.Session = Depends(require_session),
+) -> dict[str, Any]:
+    detail = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
+    templates = oa_call(oa.get_word_templates, session.base_url, session.token, lawcase_id)
+    legal_persons, orgs = oa.principal_org_kinds(detail)
+    return {
+        "case_no": detail.get("no") or detail.get("preNo"),
+        "templates": [
+            {"name": str(t.get("name") or ""), "isSelected": bool(t.get("isSelected"))}
+            for t in templates
+            if t.get("name")
+        ],
+        "principal_legal_persons": legal_persons,
+        "principal_orgs": orgs,
+    }
+
+
+@app.post("/api/cases/{lawcase_id}/documents/download")
+def api_case_doc_download(
+    lawcase_id: int,
+    body: DocDownloadBody,
+    session: sessions.Session = Depends(require_session),
+) -> dict[str, Any]:
+    names = [n.strip() for n in body.templates if n.strip()]
+    if not names:
+        raise HTTPException(status_code=422, detail="请先选择要下载的文书")
+    detail = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
+    available = [
+        str(t.get("name") or "")
+        for t in oa_call(oa.get_word_templates, session.base_url, session.token, lawcase_id)
+        if t.get("name")
+    ]
+    unknown = [n for n in names if n not in available]
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"以下文书不在本案可用模板列表中：{'、'.join(unknown)}")
+
+    additions, notes = oa.companion_documents(detail, available, names)
+    case_no = str(detail.get("no") or detail.get("preNo") or lawcase_id)
+    target_dir = DOC_DOWNLOAD_ROOT / _safe_filename(case_no)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[dict[str, Any]] = []
+    for name in names + additions:
+        content, oa_filename = oa_call(
+            oa.export_word_template, session.base_url, session.token, lawcase_id, name
+        )
+        if not content:
+            raise HTTPException(status_code=502, detail=f"《{name}》导出成功但下载内容为空，请重试")
+        filename = _safe_filename(oa_filename or f"{case_no}-{name}.docx")
+        if not Path(filename).suffix:
+            filename += ".docx"
+        path = _unique_path(target_dir / filename)
+        path.write_bytes(content)
+        saved.append(
+            {
+                "template": name,
+                "path": str(path),
+                "size": len(content),
+                "valid_docx": zipfile.is_zipfile(path),
+                "auto_added": name in additions,
+            }
+        )
+    return {"ok": True, "case_no": case_no, "dir": str(target_dir), "saved": saved, "notes": notes}
+
+
 # -------------------------------------------------------------- approvals
 
 
@@ -178,7 +274,7 @@ def api_approve(
     session: sessions.Session = Depends(require_session),
 ) -> dict[str, Any]:
     detail = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
-    old_status = int(detail.get("status") or -99)
+    old_status = oa.row_status(detail)
     if old_status != 1:
         raise HTTPException(
             status_code=409,
@@ -223,7 +319,7 @@ def api_reject(
     if not memo:
         raise HTTPException(status_code=422, detail="驳回必须填写审批意见")
     detail = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
-    old_status = int(detail.get("status") or -99)
+    old_status = oa.row_status(detail)
     if old_status != 1:
         raise HTTPException(
             status_code=409,
@@ -335,4 +431,6 @@ if _DIST.is_dir():
         target = _DIST / path
         if path and target.is_file():
             return FileResponse(target)
-        return FileResponse(_DIST / "index.html")
+        # index.html 禁缓存：WKWebView（private_mode=False 持久化）曾缓存旧入口页，
+        # 导致重新打包后窗口仍渲染旧界面；资源文件带内容哈希可正常缓存
+        return FileResponse(_DIST / "index.html", headers={"Cache-Control": "no-store"})

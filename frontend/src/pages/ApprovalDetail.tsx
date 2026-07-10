@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { ApprovalReview } from "../types";
-import { Dialog, money, Spinner } from "../components/ui";
+import { Dialog, money, Spinner, StatusBadge } from "../components/ui";
 
 export function ApprovalDetail() {
   const { id } = useParams();
@@ -35,6 +35,11 @@ export function ApprovalDetail() {
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
+    // 重新检查时重置人工确认状态，确认必须针对当前检查结果作出
+    setConflictReviewed(false);
+    setConflictMemo("");
+    setRiskReviewed(false);
+    setRiskMemo("");
     try {
       setReview(await api.approvalCheck(lawcaseId));
     } catch (err) {
@@ -55,22 +60,29 @@ export function ApprovalDetail() {
   const hardBlockers = review
     ? [
         ...review.completeness.missing.map((m) => `资料不完整: ${m}`),
+        ...(review.cause?.blockers ?? []),
         ...review.conflict.blockers,
         ...review.duplicate_filing.blockers,
         ...(review.fee_explanation?.blockers ?? []),
       ]
     : [];
 
-  const approveReady =
-    hardBlockers.length === 0 &&
-    (conflictFindings.length === 0 || (conflictReviewed && conflictMemo.trim() !== "")) &&
-    (!isRisk || riskReviewed);
+  // 案件已不在「立案待审」（他人已审/状态变更）时只读展示，禁止审批操作
+  const notPending = review !== null && review.status !== 1;
+
+  const pendingConfirms: string[] = [];
+  if (review && conflictFindings.length > 0 && !(conflictReviewed && conflictMemo.trim() !== ""))
+    pendingConfirms.push("利冲线索人工复核（勾选并填写结论）");
+  if (review && isRisk && !riskReviewed) pendingConfirms.push("风险代理收费方案审阅确认（勾选）");
+
+  const approveReady = !notPending && hardBlockers.length === 0 && pendingConfirms.length === 0;
 
   // 依据预检结果代拟驳回理由，供合伙人直接采纳或修改
   const buildRejectDraft = (): string => {
     if (!review) return "";
     const items: string[] = [];
     review.completeness.missing.forEach((m) => items.push(`立案资料不完整，缺少「${m}」，请补齐后重新提交`));
+    (review.cause?.blockers ?? []).forEach((b) => items.push(b));
     review.conflict.blockers.forEach((b) => items.push(b));
     if (review.conflict.blockers.length === 0) {
       conflictFindings.forEach((f) =>
@@ -151,10 +163,11 @@ export function ApprovalDetail() {
     <div className="flex h-full flex-col">
       <header className="border-b border-zinc-200 bg-white px-6 py-4">
         <BackButton onClick={() => navigate("/approvals")} />
-        <div className="mt-2 flex items-baseline gap-3">
+        <div className="mt-2 flex items-center gap-3">
           <h2 className="text-base font-semibold">{review.case_no || `案件 #${review.lawcase_id}`}</h2>
+          <StatusBadge status={review.status} name={review.status_name} />
           <span className="text-xs text-zinc-400">
-            {String(detail.baseTypeName ?? "")} · {String(detail.causeAction ?? "")}
+            {[String(detail.baseTypeName ?? ""), String(detail.causeAction ?? "")].filter(Boolean).join(" · ")}
           </span>
         </div>
       </header>
@@ -174,6 +187,26 @@ export function ApprovalDetail() {
           </div>
         ) : (
           <div className="mx-auto max-w-3xl space-y-4">
+            {notPending && (
+              <div className="flex items-start gap-2.5 rounded-xl border border-amber-300 bg-amber-50 p-4">
+                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                <p className="text-sm text-amber-800">
+                  该案件当前状态为「{review.status_name}」，已不在立案待审（可能已由他人审批或状态变更）。
+                  本页仅供查看，无法执行通过/驳回操作。
+                </p>
+              </div>
+            )}
+
+            <SummaryStrip
+              review={review}
+              conflictCount={conflictFindings.length}
+              duplicateCount={duplicateFindings.length}
+              isRisk={isRisk}
+              hardBlockers={hardBlockers}
+              pendingConfirms={pendingConfirms}
+              notPending={notPending}
+            />
+
             <section className="rounded-xl border border-zinc-200 bg-white p-5">
               <h3 className="mb-3 text-sm font-semibold text-zinc-800">案件信息</h3>
               <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">
@@ -203,6 +236,46 @@ export function ApprovalDetail() {
               }
             />
 
+            {review.cause && review.cause.result !== "not_applicable" && (
+              <CheckCard
+                title="案由规范性"
+                ok={review.cause.result === "ok" && (review.cause.warnings?.length ?? 0) === 0}
+                okText={`案由「${review.cause.cause_text}」命中 OA 系统案由库`}
+                problems={review.cause.blockers ?? []}
+                warning={
+                  (review.cause.blockers?.length ?? 0) === 0 && (review.cause.warnings?.length ?? 0) > 0
+                    ? review.cause.warnings!.join("；")
+                    : undefined
+                }
+              >
+                {(review.cause.matches?.length ?? 0) > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {review.cause.matches!.map((m) => (
+                      <div
+                        key={`${m.name}-${m.path}`}
+                        className="rounded-md bg-zinc-50 px-2.5 py-1.5 text-xs text-zinc-600"
+                      >
+                        <span className="font-medium text-zinc-800">{m.name}</span>
+                        <span className="ml-2 text-zinc-400">{m.path}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {(review.cause.suggestions?.length ?? 0) > 0 && (
+                  <div className="mt-2 text-xs text-zinc-500">
+                    案由库中相近的规范案由（供更正参考）：
+                    <div className="mt-1 flex flex-wrap gap-1.5">
+                      {review.cause.suggestions!.map((s) => (
+                        <span key={s} className="rounded-full bg-indigo-50 px-2 py-0.5 text-indigo-700">
+                          {s}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </CheckCard>
+            )}
+
             <CheckCard
               title="利冲检索"
               ok={review.conflict.result === "no_exact_adverse_match"}
@@ -216,14 +289,17 @@ export function ApprovalDetail() {
             >
               {conflictFindings.length > 0 && (
                 <>
-                  <FindingTable
+                  <FindingList
                     rows={conflictFindings.map((f) => ({
                       key: `${f.case_id}-${f.matched_name}`,
                       no: f.case_no || String(f.case_id),
-                      name: f.matched_name,
+                      matched: f.matched_name,
                       relation: f.relation,
-                      status: f.status_name || "",
+                      statusName: f.status_name || "",
                       severity: f.severity,
+                      wtr: f.wtr_names,
+                      tos: f.tos_names,
+                      cause: f.cause,
                     }))}
                   />
                   <div className="mt-3 space-y-2 rounded-lg bg-amber-50 p-3">
@@ -259,14 +335,18 @@ export function ApprovalDetail() {
               }
             >
               {duplicateFindings.length > 0 && (
-                <FindingTable
+                <FindingList
                   rows={duplicateFindings.map((f) => ({
                     key: String(f.case_id),
                     no: f.case_no || String(f.case_id),
-                    name: [...f.principal_overlap, ...f.opponent_overlap].join("、"),
+                    matched: [...f.principal_overlap, ...f.opponent_overlap].join("、"),
                     relation: f.relation,
-                    status: f.status_name || "",
+                    statusName: f.status_name || "",
                     severity: f.severity,
+                    wtr: f.wtr_names,
+                    tos: f.tos_names,
+                    cause: f.cause,
+                    emp: f.emp_names,
                   }))}
                 />
               )}
@@ -430,8 +510,17 @@ export function ApprovalDetail() {
         )}
       </div>
 
-      {!done && (
+      {!done && !notPending && (
         <footer className="flex items-center justify-end gap-3 border-t border-zinc-200 bg-white px-6 py-3.5">
+          {!approveReady && (
+            <span className="mr-auto text-xs text-zinc-400">
+              {hardBlockers.length > 0
+                ? `存在 ${hardBlockers.length} 项阻断，只能驳回`
+                : pendingConfirms.length > 0
+                  ? `通过前需完成：${pendingConfirms.join("；")}`
+                  : ""}
+            </span>
+          )}
           <button
             onClick={() => {
               setMemo(buildRejectDraft());
@@ -608,43 +697,150 @@ function CheckCard({
   );
 }
 
-function FindingTable({
+const SEVERITY_LABELS: Record<string, { text: string; className: string }> = {
+  high: { text: "对方案件在办 · 高风险", className: "bg-red-50 text-red-600" },
+  block: { text: "疑似重复 · 阻断", className: "bg-red-50 text-red-600" },
+  review: { text: "需人工复核", className: "bg-amber-50 text-amber-700" },
+};
+
+function FindingList({
   rows,
 }: {
-  rows: { key: string; no: string; name: string; relation: string; status: string; severity: string }[];
+  rows: {
+    key: string;
+    no: string;
+    matched: string;
+    relation: string;
+    statusName: string;
+    severity: string;
+    wtr: string | null;
+    tos: string | null;
+    cause: string | null;
+    emp?: string | null;
+  }[];
 }) {
   return (
-    <div className="mt-3 overflow-hidden rounded-lg border border-zinc-200">
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="bg-zinc-50 text-left text-zinc-500">
-            <th className="px-3 py-2 font-medium">案号</th>
-            <th className="px-3 py-2 font-medium">命中主体</th>
-            <th className="px-3 py-2 font-medium">关系</th>
-            <th className="px-3 py-2 font-medium">状态</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.key} className="border-t border-zinc-100">
-              <td className="px-3 py-2 font-medium text-zinc-800">{r.no}</td>
-              <td className="px-3 py-2 text-zinc-700">{r.name}</td>
-              <td className="px-3 py-2 text-zinc-600">{r.relation}</td>
-              <td className="px-3 py-2">
-                <span
-                  className={`rounded-full px-1.5 py-0.5 ${
-                    r.severity === "high" || r.severity === "block"
-                      ? "bg-red-50 text-red-600"
-                      : "bg-amber-50 text-amber-700"
-                  }`}
-                >
-                  {r.status || r.severity}
-                </span>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="mt-3 space-y-2">
+      {rows.map((r) => {
+        const severity = SEVERITY_LABELS[r.severity] ?? SEVERITY_LABELS.review;
+        return (
+          <div key={r.key} className="rounded-lg border border-zinc-200 bg-zinc-50/50 p-3 text-xs">
+            <div className="mb-1 flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-zinc-800">{r.no}</span>
+              {r.statusName && (
+                <span className="rounded-full bg-zinc-100 px-1.5 py-0.5 text-zinc-600">{r.statusName}</span>
+              )}
+              <span className={`rounded-full px-1.5 py-0.5 font-medium ${severity.className}`}>
+                {severity.text}
+              </span>
+            </div>
+            <div className="text-zinc-700">
+              {r.wtr || "—"} <span className="text-zinc-300">↔</span> {r.tos || "—"}
+              {r.cause && (
+                <>
+                  <span className="mx-1.5 text-zinc-300">·</span>
+                  {r.cause}
+                </>
+              )}
+              {r.emp && (
+                <>
+                  <span className="mx-1.5 text-zinc-300">·</span>
+                  经办 {r.emp}
+                </>
+              )}
+            </div>
+            <div className="mt-1 text-zinc-500">
+              命中主体「{r.matched}」— {r.relation}
+            </div>
+          </div>
+        );
+      })}
     </div>
+  );
+}
+
+const SUMMARY_STATES = {
+  ok: { text: "通过", className: "bg-emerald-50 text-emerald-700" },
+  warn: { text: "需人工复核", className: "bg-amber-50 text-amber-700" },
+  block: { text: "阻断", className: "bg-red-50 text-red-600" },
+  na: { text: "不适用", className: "bg-zinc-100 text-zinc-400" },
+} as const;
+
+function SummaryStrip({
+  review,
+  conflictCount,
+  duplicateCount,
+  isRisk,
+  hardBlockers,
+  pendingConfirms,
+  notPending,
+}: {
+  review: ApprovalReview;
+  conflictCount: number;
+  duplicateCount: number;
+  isRisk: boolean;
+  hardBlockers: string[];
+  pendingConfirms: string[];
+  notPending: boolean;
+}) {
+  const items: { label: string; state: keyof typeof SUMMARY_STATES }[] = [
+    { label: "资料完整性", state: review.completeness.missing.length > 0 ? "block" : "ok" },
+    {
+      label: "案由规范",
+      state:
+        !review.cause || review.cause.result === "not_applicable"
+          ? "na"
+          : (review.cause.blockers?.length ?? 0) > 0
+            ? "block"
+            : (review.cause.warnings?.length ?? 0) > 0
+              ? "warn"
+              : "ok",
+    },
+    {
+      label: "利冲检索",
+      state: review.conflict.blockers.length > 0 ? "block" : conflictCount > 0 ? "warn" : "ok",
+    },
+    {
+      label: "重复立案",
+      state: review.duplicate_filing.blockers.length > 0 ? "block" : duplicateCount > 0 ? "warn" : "ok",
+    },
+    {
+      label: "低收费审查",
+      state:
+        review.fee_explanation?.result === "not_applicable"
+          ? "na"
+          : (review.fee_explanation?.blockers?.length ?? 0) > 0
+            ? "block"
+            : "ok",
+    },
+    { label: "风险代理", state: !isRisk ? "na" : "warn" },
+  ];
+
+  const verdict = notPending
+    ? { text: "案件已不在立案待审，本页仅供查看", className: "text-amber-700" }
+    : hardBlockers.length > 0
+      ? { text: `存在 ${hardBlockers.length} 项阻断，无法通过（可驳回）`, className: "text-red-600" }
+      : pendingConfirms.length > 0
+        ? { text: `可通过，尚需完成：${pendingConfirms.join("；")}`, className: "text-amber-700" }
+        : { text: "各项检查通过，可以通过审批", className: "text-emerald-700" };
+
+  return (
+    <section className="rounded-xl border border-zinc-200 bg-white p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        {items.map((item) => {
+          const state = SUMMARY_STATES[item.state];
+          return (
+            <span
+              key={item.label}
+              className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium ${state.className}`}
+            >
+              {item.label}
+              <span className="opacity-70">· {state.text}</span>
+            </span>
+          );
+        })}
+      </div>
+      <p className={`mt-2.5 text-sm font-medium ${verdict.className}`}>{verdict.text}</p>
+    </section>
   );
 }

@@ -6,7 +6,7 @@ import type { User } from "../types";
 
 const NAV = [
   { to: "/cases", label: "案件看板", icon: LayoutGrid },
-  { to: "/approvals", label: "立案审批", icon: ClipboardCheck },
+  { to: "/approvals", label: "案件审批", icon: ClipboardCheck },
   { to: "/assistant", label: "办案助手", icon: Briefcase },
 ];
 
