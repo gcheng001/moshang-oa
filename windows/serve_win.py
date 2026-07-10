@@ -90,6 +90,65 @@ def find_edge() -> Path | None:
     return None
 
 
+APP_TITLE = "办公助手"
+
+
+def _find_icon() -> Path | None:
+    # 便携包布局：<包根>/AppIcon.ico；仓库布局：<仓库>/docs/appicon/AppIcon.ico
+    for cand in (PKG_ROOT / "AppIcon.ico", PKG_ROOT.parent / "docs" / "appicon" / "AppIcon.ico"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _apply_window_icon() -> None:
+    """给原生窗口的标题栏/任务栏设置软件图标（pywebview 在 Windows 下不支持直接传 icon）。"""
+    icon = _find_icon()
+    if icon is None:
+        return
+    try:
+        import ctypes
+
+        WM_SETICON, IMAGE_ICON = 0x0080, 1
+        LR_LOADFROMFILE, LR_DEFAULTSIZE = 0x0010, 0x0040
+        for _ in range(100):  # 最多等 20 秒窗口出现
+            hwnd = ctypes.windll.user32.FindWindowW(None, APP_TITLE)
+            if hwnd:
+                hicon = ctypes.windll.user32.LoadImageW(
+                    None, str(icon), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+                )
+                if hicon:
+                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 0, hicon)
+                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 1, hicon)
+                return
+            time.sleep(0.2)
+    except Exception:
+        log("设置窗口图标失败（不影响使用）：\n" + traceback.format_exc())
+
+
+def open_native_window(url: str) -> bool:
+    """首选：pywebview + WebView2 原生窗口——独立软件观感，无浏览器痕迹。"""
+    try:
+        import webview
+    except Exception:
+        log("pywebview 不可用，退回 Edge 应用模式：\n" + traceback.format_exc())
+        return False
+    try:
+        import ctypes
+
+        # 独立 AppUserModelID：任务栏不与其他 Python 程序混组
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MoshangOA.App")
+    except Exception:
+        pass
+    webview.create_window(APP_TITLE, url, width=1360, height=860, min_size=(960, 640))
+    threading.Thread(target=_apply_window_icon, daemon=True).start()
+    log("用原生窗口（WebView2）打开")
+    # private_mode=False + storage_path：localStorage 持久化（记住的 API Key 不丢）
+    webview.start(private_mode=False, storage_path=str(PKG_ROOT / "webview-profile"))
+    log("窗口已关闭，退出")
+    return True
+
+
 def main() -> None:
     log("启动器开始运行")
     if not port_in_use(PORT):
@@ -101,6 +160,8 @@ def main() -> None:
     log("后端就绪")
 
     url = f"http://{HOST}:{PORT}/"
+    if open_native_window(url):
+        return
     edge = find_edge()
     if edge is not None:
         # 独立 user-data-dir：①强制新开 Edge 进程，窗口关闭时本脚本才能感知退出；

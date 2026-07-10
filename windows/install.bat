@@ -70,10 +70,10 @@ if errorlevel 1 (
     goto fail
   )
 )
-"%RUNTIME%\python.exe" -m pip install --no-warn-script-location -i %PIP_MIRROR% "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "colorama"
+"%RUNTIME%\python.exe" -m pip install --no-warn-script-location -i %PIP_MIRROR% "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "colorama" "setuptools" "pywebview"
 if errorlevel 1 (
   echo   清华镜像安装失败，改用官方 PyPI 重试 ...
-  "%RUNTIME%\python.exe" -m pip install --no-warn-script-location "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "colorama"
+  "%RUNTIME%\python.exe" -m pip install --no-warn-script-location "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "colorama" "setuptools" "pywebview"
   if errorlevel 1 (
     echo [失败] 依赖安装失败，请把本窗口截图发给管理员
     goto fail
