@@ -32,6 +32,16 @@ else:
 LOG_DIR = PKG_ROOT / "logs"
 sys.path.insert(0, str(BACKEND_DIR))
 
+# pythonw（双击、无控制台）下 sys.stdout/stderr 为 None，
+# uvicorn 配置日志时调 sys.stdout.isatty() 会直接崩 —— 接到日志文件兜底
+if sys.stdout is None or sys.stderr is None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _stdio = open(LOG_DIR / "moshang_stdio.log", "a", encoding="utf-8", buffering=1)
+    if sys.stdout is None:
+        sys.stdout = _stdio
+    if sys.stderr is None:
+        sys.stderr = _stdio
+
 
 def log(message: str) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -45,12 +55,19 @@ def port_in_use(port: int) -> bool:
 
 
 def run_server() -> None:
-    import uvicorn
+    try:
+        import uvicorn
 
-    uvicorn.run("app.main:app", host=HOST, port=PORT, log_level="warning")
+        uvicorn.run("app.main:app", host=HOST, port=PORT, log_level="warning")
+    except BaseException:
+        # pythonw 无控制台，后端线程异常必须落日志，否则只见"启动超时"不见病因
+        log("后端线程异常：\n" + traceback.format_exc())
+        raise
 
 
-def wait_ready(timeout: float = 20.0) -> None:
+# 首次运行时 Defender 实时扫描新解压的数百个 pyd/py 文件，导入可能远超 20 秒，
+# 放宽到 90 秒避免冷启动误判超时（正常启动 1-3 秒，不受影响）
+def wait_ready(timeout: float = 90.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
