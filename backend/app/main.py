@@ -134,8 +134,26 @@ def api_case_detail(
 
 # ------------------------------------------------------------- documents
 
-# HOME 可能被启动环境重定向（同 assistant.REAL_HOME 的坑），文书固定落真实桌面
-DOC_DOWNLOAD_ROOT = assistant.REAL_HOME / "Desktop" / "文书下载"
+# HOME 可能被启动环境重定向（同 assistant.REAL_HOME 的坑），文书固定落真实桌面。
+# Windows 下桌面可能被重定向（如用户目录在 D 盘、桌面在 C 盘），必须查注册表 Shell Folders
+def _desktop_dir() -> Path:
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            ) as key:
+                desktop = Path(winreg.QueryValueEx(key, "Desktop")[0])
+                if desktop.is_dir():
+                    return desktop
+        except OSError:
+            pass
+    return assistant.REAL_HOME / "Desktop"
+
+
+DOC_DOWNLOAD_ROOT = _desktop_dir() / "文书下载"
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"|?*\\/]')
 
 
