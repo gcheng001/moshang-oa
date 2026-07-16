@@ -11,15 +11,15 @@
 2. 双击 `windows\install.bat`（一次性：走华为云/npmmirror 镜像下载内嵌 Python 3.12 + 清华镜像装依赖，约 1-3 分钟）
 3. 以后每次双击 `windows\start.bat` 启动
 
-要点：前端产物 `frontend/dist` 已入库（268K），Windows 端零构建；`serve_win.py` 自动识别仓库布局/便携包布局；`.gitattributes` 强制 `.bat` 保持 CRLF（LF 批处理在部分环境双击无反应，此前踩坑）；`start.bat` 改用 `python.exe` 带控制台启动，出错会停住显示原因（旧版 `pythonw.exe` 静默失败无从排查）。
+要点：前端产物 `frontend/dist` 已入库，Windows 端零构建；`serve_win.py` 自动识别仓库布局/便携包布局；便携包构建会把 `.bat` 统一为 CRLF；`start.bat` 改用 `python.exe` 带控制台启动，出错会停住显示原因（旧版 `pythonw.exe` 静默失败无从排查）。
 
-备选路径：Mac 上执行 `windows/build_windows_package.sh` 组装免安装包 `windows/dist/MoshangOA-Win-<日期>.zip`（约 14M，内嵌 Python + win_amd64 wheels，解压双击 `start.bat` 即用）。
+备选路径：Mac 上执行 `windows/build_windows_package.sh` 组装免安装包 `windows/dist/MoshangOA-Win-<日期>.zip`（当前约 24M，内嵌 Python、WebView2 壳和 win_amd64 依赖，解压双击 `start.bat` 即用）。
 
-运行时用 **Edge 应用模式**（`--app` + 独立 `edge-profile` 保证进程独立可感知窗口关闭、localStorage 持久化记住 API Key）替代 pywebview，免 pythonnet/WebView2 依赖；未装 Edge 时退回默认浏览器。办案助手模块依赖 macOS 工具链，Windows 端自动降级不可用（`assistant.py` 以 `IS_WINDOWS` 分支处理 pwd/reveal/文件选择）。日志在 `logs/moshang_win.log`（GitHub 方式在 `windows/logs/`）。
+Windows 运行时优先使用原生 WebView2 窗口，回退时使用 **Edge 应用模式**（`--app` + 独立资料目录）。关闭主窗口后，系统托盘保持本地服务和已开启的自动审批运行；仅选择托盘“退出办公助手”才停止。账号密码只在选择“保持登录”后写入操作系统凭据库，绝不写入浏览器存储。办案助手模块依赖 macOS 工具链，Windows 端自动降级不可用（`assistant.py` 以 `IS_WINDOWS` 分支处理 pwd/reveal/文件选择）。日志在 `logs/moshang_win.log`（GitHub 方式在 `windows/logs/`）。
 
 ## 一键启动
 
-- **应用程序 → 办案工具集 → 办公助手**（`/Applications/办案工具集/办公助手.app`，推荐）：启动器强制 `arch -arm64`（LaunchServices 可能用 Rosetta 跑脚本型 app，venv 原生库是 arm64），日志在 `/tmp/moshang_oa_app.log`，图标源文件在 `docs/appicon/`
+- **应用程序 → 办案工具集 → 办公助手**（`/Applications/办案工具集/办公助手.app`，推荐）：独立 arm64 应用，当前版本 2.1.1；可用 `macos/build_macos_app.sh` 重复构建
 - 或双击项目根目录的 **`启动办公助手.command`**
 
 两者都会自动拉起本地后端（端口 8017）并打开桌面窗口。
@@ -41,9 +41,9 @@ cd frontend && npm run build
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| 登录 | ✅ | 每人输入自己的 Agent API Key，本机可记住 |
+| 登录 | ✅ | 每人使用自己的 OA 账号密码；可选择保存到操作系统凭据库 |
 | 案件看板 | ✅ | 表格/看板双视图（含「其他状态」兜底列），关键词/状态/类型筛选，案件详情抽屉，未收金额高亮 |
-| 文书下载 | ✅ | 案件详情抽屉内（2026-07-10 接入）：列出本案 OA 可用文书模板 → 勾选下载到 `~/Desktop/文书下载/{案号}/`；委托人为法人/非法人组织时自动附带法定代表身份证明书/负责人证明书（2026-06-17 硬规则），同名加后缀防覆盖，下载后校验 docx 完整性，可在访达中显示 |
+| 文书下载 | ✅ | 案件详情抽屉内列出本案 OA 可用文书模板，勾选后由用户选择保存目录；委托人为法人/非法人组织时自动附带法定代表身份证明书/负责人证明书，同名加后缀防覆盖，并校验 docx 完整性 |
 | 案件审批 | ✅ | 待审清单 → 自动合规检查（完整性/**案由规范性**/利冲/OA重复立案/低收费/风险收费）→ 检查结论汇总条 → 通过/驳回 → 回读校验；利冲/重复命中显示对方案件当事人+案由+经办；案件已不在待审状态时只读守卫 |
 | 结案待审 | 👁 | 只读展示（OA 结案审批接口未攻克，见 skill HANDOFF） |
 | 办案助手 | ✅ | 整合「办案材料助手」：材料转换（多引擎OCR/Office/音视频逐字稿/MD转Word）、微信录屏取证、证据整理（汇总+时间线+案件OS输入包），后台任务队列+日志 |
@@ -58,7 +58,7 @@ cd frontend && npm run build
         ├── main.py             # REST API + 托管 frontend/dist
         ├── oa.py               # OA 客户端（移植自 moshang-oa skill 的 oa_probe.py）
         ├── assistant.py        # 办案助手：包装办案材料助手 CLI + 移植证据整理，后台任务管理
-        └── sessions.py         # apikey→token 会话，自动续期
+        └── sessions.py         # 账号密码→token 会话，自动续期
 frontend/                       # React 18 + TS + Tailwind v4 + Vite
     └── src/pages/              # Login / CaseBoard / Approvals / ApprovalDetail / Assistant
 ```
@@ -69,7 +69,7 @@ frontend/                       # React 18 + TS + Tailwind v4 + Vite
 
 ## 合规门禁（立案审批，2026-07-08 规则）
 
-1. **资料完整性** — 委托人/对方/律师/案由/阶段/收费缺失即阻断；**案情摘要缺失仅提示，不拦截**
+1. **资料完整性** — 委托人/对方/律师/案由或罪名/阶段/收费缺失即阻断；刑事案件不要求对方当事人；**案情摘要缺失仅提示，不拦截**
 1a. **案由规范性**（2026-07-10 新增）— 案由/罪名必须命中 OA 系统案由库（`GetCaseHeads` 全量 12 棵树约 2009 节点，含刑事罪名/民事案由 2011 版等，进程内缓存 12h）：自由填写文本**硬阻断**并给出相近规范案由建议；顶级分类节点硬阻断；非末级案由仅提示；含顿号罪名（如「拒不执行判决、裁定罪」）整串优先匹配，多案由顿号并列逐一校验；登记案由与字典关联案由不一致时提示
 2. **利冲检索** — 对立方向命中须合伙人勾选「已人工复核」并填写结论（写入审批意见）
 3. **OA 重复立案** — 同委托人+同对方+同案由的**在办/待处理**案件（status 1/3/4/5）直接阻断；历史「立案未通过」（status 2，常见于驳回后重报）与已结案/已撤销/已归档记录降级为人工复核提示，不误阻断（2026-07-10 修正）

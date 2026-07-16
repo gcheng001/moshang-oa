@@ -4,6 +4,7 @@ export interface User {
   employeeId: number | null;
   employeeName: string | null;
   lawfirmName: string | null;
+  canApprove: boolean;
 }
 
 export interface CaseRow {
@@ -36,6 +37,24 @@ export interface CaseListResponse {
 export interface PendingResponse {
   filing: CaseRow[];
   closing: CaseRow[];
+}
+
+export interface AutomationStatus {
+  enabled: boolean;
+  mode: "shadow" | "active";
+  shadow_remaining_seconds: number;
+  poll_minutes: number;
+  last_checked_at: string | null;
+  last_error: string | null;
+  events: {
+    at: string;
+    kind: string;
+    case_id?: number;
+    case_no?: string;
+    action?: string;
+    reasons?: string[];
+    message?: string;
+  }[];
 }
 
 export interface ConflictFinding {
@@ -123,7 +142,15 @@ export interface ApprovalReview {
   case_no: string | null;
   status: number;
   status_name: string;
-  completeness: { result: string; missing: string[]; warnings: string[] };
+  base_type_name: string | null;
+  non_litigation?: boolean;
+  completeness: {
+    result: string;
+    missing: string[];
+    warnings: string[];
+    non_litigation?: boolean;
+    criminal_case?: boolean;
+  };
   cause: {
     result: string;
     cause_text: string | null;
@@ -152,6 +179,8 @@ export interface ApprovalReview {
     memo: string | null;
     memo_amounts?: number[];
     blockers?: string[];
+    non_litigation?: boolean;
+    note?: string;
   };
   risk_charge: {
     result: string;

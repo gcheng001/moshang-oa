@@ -6,42 +6,29 @@ Starts the FastAPI backend on a local port, then opens a native window
 
 from __future__ import annotations
 
-import socket
 import threading
-import time
-from urllib.request import urlopen
 
 import uvicorn
 import webview
+from app.local_server import is_expected_backend, port_in_use, wait_for_expected_backend
+from app.main import app
 
 HOST = "127.0.0.1"
 PORT = 8017
 
 
-def port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        return sock.connect_ex((HOST, port)) == 0
-
-
 def run_server() -> None:
-    uvicorn.run("app.main:app", host=HOST, port=PORT, log_level="warning")
-
-
-def wait_ready(timeout: float = 15.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            urlopen(f"http://{HOST}:{PORT}/", timeout=1)
-            return
-        except Exception:
-            time.sleep(0.3)
-    raise RuntimeError("后端启动超时")
+    # Pass the imported ASGI object rather than a string import path: packaged
+    # macOS apps do not have the source-tree `app` package on sys.path.
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
 
 
 def main() -> None:
-    if not port_in_use(PORT):
+    if not port_in_use(HOST, PORT):
         threading.Thread(target=run_server, daemon=True).start()
-    wait_ready()
+    elif not is_expected_backend(HOST, PORT):
+        raise RuntimeError(f"端口 {PORT} 已被其他程序占用，请关闭占用程序后重试")
+    wait_for_expected_backend(HOST, PORT, timeout=15.0)
     webview.create_window(
         "办公助手",
         f"http://{HOST}:{PORT}/",
@@ -50,7 +37,7 @@ def main() -> None:
         min_size=(1024, 640),
     )
     # private_mode=False：WKWebView 用持久化数据仓，否则 localStorage 每次启动清空，
-    # 「记住 API Key」无法生效
+    # 使用独立 WebView 资料目录，不与日常浏览器资料混用
     webview.start(private_mode=False)
 
 

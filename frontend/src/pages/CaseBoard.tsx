@@ -94,7 +94,7 @@ export function CaseBoard() {
       <header className="flex items-center justify-between border-b border-zinc-200 bg-white px-6 py-4">
         <div className="flex items-center gap-4">
           <div>
-            <h2 className="text-base font-semibold">案件看板</h2>
+            <h2 className="text-base font-semibold">案件列表</h2>
             <p className="text-xs text-zinc-400">共 {total} 件</p>
           </div>
           {employeeId !== null && (
@@ -413,7 +413,9 @@ function DocDownloadSection({ lawcaseId }: { lawcaseId: number }) {
     setDownloadError("");
     setResult(null);
     try {
-      setResult(await api.caseDocDownload(lawcaseId, [...checked]));
+      const picked = await api.documentPickDirectory();
+      if (!picked.path) return;
+      setResult(await api.caseDocDownload(lawcaseId, [...checked], picked.path));
     } catch (err) {
       setDownloadError(err instanceof Error ? err.message : String(err));
     } finally {

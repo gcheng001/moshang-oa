@@ -19,7 +19,7 @@ if exist "%~dp0runtime\python.exe" (
 )
 
 echo 正在启动办公助手，稍候会弹出应用窗口...
-echo （本控制台可最小化，关闭应用窗口即完全退出）
+echo （关闭主窗口后仍会在系统托盘常驻；从托盘菜单“退出办公助手”才会停止）
 "%PYEXE%" "%SCRIPT%"
 if errorlevel 1 (
   echo.

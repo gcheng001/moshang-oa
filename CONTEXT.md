@@ -1,41 +1,33 @@
-# 摩尚OA — Domain Context
+# 办公助手
 
-> This glossary defines the canonical business terms. Implementation decisions live in `docs/adr/`. Keep this file free of code, APIs, and architecture.
+面向摩尚律师事务所日常工作的统一桌面工作台。它把 OA 业务与本机办案工具放在同一个产品入口中，但两类能力保持清晰边界。
 
-## Bounded Context
+## Language
 
-**摩尚OA** is a desktop application for a small law firm (摩尚律师事务所). It wraps the firm's existing cloud OA system (`moshang2.ycq6.com`) into a purpose-built native client for daily operations: filing cases, reviewing pending approvals, and downloading generated legal documents.
+**办公助手**:
+律师处理日常办公与办案辅助工作的统一产品，包括 OA 业务和本机办案工具两个领域。
+_Avoid_: 摩尚OA客户端、审批客户端
 
-## Users
+**OA 业务**:
+围绕律所既有 OA 中的案件、立案审批和文书开展的业务。
+_Avoid_: 办案助手、材料工具
 
-| Term | Definition |
-|------|-----------|
-| **承办律师** (Handling Lawyer) | A licensed lawyer at the firm who files cases, downloads documents, and manages their own caseload. The primary daily user. |
-| **审批人** (Approver) | A partner-level lawyer who reviews and approves/rejects pending case filings before they become official. A single person may be both Handling Lawyer and Approver. |
+**本机办案工具**:
+在用户电脑上处理材料转换、微信录屏取证和证据整理的辅助能力，不直接改变 OA 案件状态。
+_Avoid_: OA 业务、案件审批
 
-The application serves 2–3 concurrent users. There is no admin role distinct from these two.
+**发布站点**:
+供用户获取办公助手安装包、查看当前版本和阅读更新说明的公开网站。
+_Avoid_: 审批协调服务、项目源码仓库
 
-## Core Concepts
+**应用更新**:
+办公助手发现新版本后提示用户下载、校验并确认安装的版本升级过程。
+_Avoid_: 未经确认的静默更新、网站内容更新
 
-| Term | Definition |
-|------|-----------|
-| **案件** (Case) | A legal engagement tracked in the OA. Has a type (civil 民事 or criminal 刑事), a normative cause/charge, parties, handling lawyers, fee terms, and a lifecycle status. |
-| **立案** (Case Filing) | The act of registering a new Case in the OA, including all required fields: parties, cause, court, lawyers, fee method, authorization type. |
-| **立案审批** (Filing Approval) | A gate where an Approver reviews a newly filed Case before it becomes active. Includes automated pre-checks (completeness, conflict of interest, duplicate filing). |
-| **利冲检索** (Conflict Check) | An automated search that detects whether the parties in a new filing conflict with existing cases in the firm — same party appearing on opposing sides. |
-| **文书** (Legal Document) | Generated documents bound to a Case: engagement letters (委托书), powers of attorney (授权委托书), etc. Downloaded from the OA. |
-| **案由** (Cause of Action) | The normative legal classification of a civil Case, selected from the OA dictionary — not free text. |
-| **罪名** (Criminal Charge) | The normative charge for a criminal Case, selected from the OA dictionary. |
-| **收费方案 / 收费说明** (Fee Scheme) | Free-text description of how the case fee is structured (e.g. upfront amount + percentage of recovery), stored in the OA. One field serves both purposes: it is the fee *scheme* reviewed for risk-fee cases and the fee *explanation* required for low-fee cases. |
-| **低收费审查** (Low-Fee Review) | An approval gate rule: any case with an entrusted fee below ¥5,000 must have a Fee Scheme on file, otherwise it cannot pass Filing Approval. |
-| **风险代理** (Contingency/Risk Fee) | A fee arrangement contingent on case outcome, regulated by 司发通〔2021〕87号: prohibited for certain case types, capped by a graduated percentage of the subject amount. The system renders a preliminary compliance judgment; the Approver makes the final call. |
-| **API Key** | A per-user credential issued by the OA backend. Used to authenticate and obtain a session token. Each user has their own key. |
-| **Token** | A temporary session credential obtained by exchanging an API Key. All subsequent OA requests use this token. |
+**承办律师**:
+负责登记案件、管理案件和使用办案材料的律师。
+_Avoid_: 普通用户、操作员
 
-## Out of Scope (not in this application)
-
-- **录屏取证** (Screen Recording Evidence) — lives in the separate 案件看板 tool.
-- **飞书多维表格** — the firm's Feishu tables are a separate data system; this app only talks to the OA.
-- **结案审批** (Case Closure Approval) — the OA API for closure approval is unverified; deferred to a future version.
-- **收费管理** (Fee Management) — read-only financial overview may appear later; no write operations planned.
-- **团队管理** (Team Management) — not in scope.
+**审批人**:
+负责审查立案申请并决定通过或驳回的合伙人级律师；同一人可以同时是承办律师和审批人。
+_Avoid_: 管理员、审核员

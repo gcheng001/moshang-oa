@@ -2,19 +2,23 @@ import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChevronRight, RotateCw } from "lucide-react";
 import { api } from "../api";
-import type { CaseRow, PendingResponse } from "../types";
+import type { AutomationStatus, CaseRow, PendingResponse } from "../types";
 import { EmptyState, money, Spinner } from "../components/ui";
 
 export function Approvals() {
   const [data, setData] = useState<PendingResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [automation, setAutomation] = useState<AutomationStatus | null>(null);
+  const [automationBusy, setAutomationBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      setData(await api.pending());
+      const [pending, automationStatus] = await Promise.all([api.pending(), api.automationStatus()]);
+      setData(pending);
+      setAutomation(automationStatus);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -25,6 +29,32 @@ export function Approvals() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const updateAutomation = async (enabled: boolean) => {
+    setAutomationBusy(true);
+    setError("");
+    try {
+      setAutomation(await api.automationSet(enabled));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAutomationBusy(false);
+    }
+  };
+
+  const checkNow = async () => {
+    setAutomationBusy(true);
+    setError("");
+    try {
+      await api.automationCheckNow();
+      setAutomation(await api.automationStatus());
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAutomationBusy(false);
+    }
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -51,6 +81,44 @@ export function Approvals() {
           <EmptyState title="加载失败" hint={error} />
         ) : (
           <div className="space-y-8">
+            <section className="rounded-xl border border-indigo-100 bg-indigo-50/50 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-indigo-950">自动审批</h3>
+                  <p className="mt-1 text-xs text-indigo-700">
+                    {automation?.enabled
+                      ? automation.mode === "shadow"
+                        ? `观察期运行中：还剩约 ${Math.ceil(automation.shadow_remaining_seconds / 3600)} 小时，仅模拟不写入 OA。`
+                        : `已开启：每 ${automation.poll_minutes} 分钟检查一次。`
+                      : "关闭状态。开启后需保持登录；前三天只模拟，手动审批仍会真实写入 OA。"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {automation?.enabled && (
+                    <button
+                      disabled={automationBusy}
+                      onClick={() => void checkNow()}
+                      className="rounded-lg border border-indigo-200 bg-white px-3 py-2 text-xs font-medium text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+                    >
+                      立即检查
+                    </button>
+                  )}
+                  <button
+                    disabled={automationBusy}
+                    onClick={() => void updateAutomation(!automation?.enabled)}
+                    className={`rounded-lg px-3 py-2 text-xs font-medium text-white disabled:opacity-50 ${automation?.enabled ? "bg-zinc-600 hover:bg-zinc-700" : "bg-indigo-600 hover:bg-indigo-700"}`}
+                  >
+                    {automation?.enabled ? "关闭自动审批" : "开启自动审批"}
+                  </button>
+                </div>
+              </div>
+              {automation?.last_error && <p className="mt-2 text-xs text-red-600">最近检查失败：{automation.last_error}</p>}
+              {automation?.events?.[0] && (
+                <p className="mt-2 truncate text-xs text-indigo-700">
+                  最近记录：{automation.events[0].case_no || "系统"} · {automation.events[0].message || automation.events[0].kind}
+                </p>
+              )}
+            </section>
             <section>
               <h3 className="mb-3 text-sm font-medium text-zinc-700">立案待审</h3>
               {data && data.filing.length > 0 ? (

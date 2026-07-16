@@ -197,6 +197,16 @@ export function ApprovalDetail() {
               </div>
             )}
 
+            {review.non_litigation && (
+              <div className="flex items-start gap-2.5 rounded-xl border border-sky-300 bg-sky-50 p-4">
+                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-sky-600" />
+                <p className="text-sm text-sky-800">
+                  本案为「{review.base_type_name}」非诉讼业务，已适用放宽审查标准：不要求案件阶段、不作低收费门槛审查。
+                  利冲检索、重复立案、案由规范性仍正常校验。
+                </p>
+              </div>
+            )}
+
             <SummaryStrip
               review={review}
               conflictCount={conflictFindings.length}

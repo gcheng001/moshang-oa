@@ -16,6 +16,8 @@ dist-ssr
 windows/cache/
 windows/runtime/
 windows/dist/
+macos/.build/
+macos/dist/
 edge-profile/
 
 # Python

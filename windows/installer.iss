@@ -4,7 +4,7 @@
 
 #define MyAppName "办公助手"
 #define MyAppNameASCII "MoshangOA"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.1.1"
 #define MyAppPublisher "摩尚律师事务所"
 #define MyAppExeName "办公助手"
 
@@ -55,9 +55,8 @@ Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parame
 [Run]
 Filename: "{app}\python\pythonw.exe"; Parameters: "serve_win.py"; WorkingDir: "{app}\app\backend"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-; 卸载前先杀掉残留的 python 进程（避免文件占用）
-Filename: "{cmd}"; Parameters: "/c taskkill /IM python.exe /IM pythonw.exe /F 2>nul"; Flags: runhidden; RunOnceId: "KillPython"
+; 卸载前请从系统托盘退出办公助手。不能按进程名 taskkill，
+; 否则会误杀用户正在运行的其他 Python 程序。
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\edge-profile"

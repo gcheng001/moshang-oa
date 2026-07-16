@@ -5,8 +5,8 @@ import { api } from "../api";
 import type { User } from "../types";
 
 const NAV = [
-  { to: "/cases", label: "案件看板", icon: LayoutGrid },
-  { to: "/approvals", label: "案件审批", icon: ClipboardCheck },
+  { to: "/cases", label: "案件列表", icon: LayoutGrid },
+  { to: "/approvals", label: "案件审批", icon: ClipboardCheck, requiresApproval: true },
   { to: "/assistant", label: "办案助手", icon: Briefcase },
 ];
 
@@ -37,6 +37,7 @@ export function Layout({ user, onLogout }: { user: User; onLogout: () => void })
   }, []);
 
   const poll = useCallback(async () => {
+    if (!user.canApprove) return;
     try {
       const data = await api.pending();
       const ids = data.filing.map((row) => row.id);
@@ -51,7 +52,7 @@ export function Layout({ user, onLogout }: { user: User; onLogout: () => void })
     } catch {
       /* 会话失效等情况静默跳过，下个周期重试 */
     }
-  }, [markSeen]);
+  }, [markSeen, user.canApprove]);
 
   useEffect(() => {
     void poll();
@@ -90,7 +91,7 @@ export function Layout({ user, onLogout }: { user: User; onLogout: () => void })
         </div>
 
         <nav className="flex-1 space-y-0.5 px-3 pt-2">
-          {NAV.map(({ to, label, icon: Icon }) => (
+          {NAV.filter((item) => !item.requiresApproval || user.canApprove).map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
               to={to}

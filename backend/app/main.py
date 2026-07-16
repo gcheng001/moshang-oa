@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import assistant, oa, sessions
+from . import assistant, automation, credentials, dialogs, oa, sessions
+from .local_server import APP_ID, APP_VERSION
 
 DEFAULT_BASE_URL = os.environ.get("MOSHANG_OA_BASE_URL", oa.DEFAULT_BASE_URL)
 
@@ -34,6 +36,16 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def start_automation_scheduler() -> None:
+    automation.start_scheduler()
+
+
+@app.get("/api/health")
+def api_health() -> dict[str, str]:
+    return {"app": APP_ID, "version": APP_VERSION}
+
+
 def require_session(x_session_id: str | None = Header(default=None)) -> sessions.Session:
     try:
         session = sessions.get(x_session_id)
@@ -41,6 +53,12 @@ def require_session(x_session_id: str | None = Header(default=None)) -> sessions
         raise HTTPException(status_code=401, detail=f"会话已失效，请重新登录（{exc}）") from exc
     if session is None:
         raise HTTPException(status_code=401, detail="未登录或会话已过期")
+    return session
+
+
+def require_approval_session(session: sessions.Session = Depends(require_session)) -> sessions.Session:
+    if not session.can_approve:
+        raise HTTPException(status_code=403, detail="当前账号无审批权限")
     return session
 
 
@@ -57,38 +75,79 @@ def oa_call(fn, *args, **kwargs):
 
 
 class LoginBody(BaseModel):
-    apikey: str
+    username: str
+    password: str
+    remember: bool = False
     base_url: str | None = None
+
+
+def _user_payload(session: sessions.Session) -> dict[str, Any]:
+    profile = session.profile
+    return {
+        "userId": profile.get("userId"),
+        "userName": profile.get("userName"),
+        "employeeId": profile.get("employeeId"),
+        "employeeName": profile.get("employeeName"),
+        "lawfirmName": profile.get("lawfirmName"),
+        "canApprove": session.can_approve,
+    }
+
+
+@app.get("/api/me")
+def api_current_user(session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+    return _user_payload(session)
 
 
 @app.post("/api/login")
 def api_login(body: LoginBody) -> dict[str, Any]:
     base_url = (body.base_url or DEFAULT_BASE_URL).strip()
-    apikey = body.apikey.strip()
-    if not apikey:
-        raise HTTPException(status_code=422, detail="请输入 API Key")
+    username = body.username.strip()
+    if not username or not body.password:
+        raise HTTPException(status_code=422, detail="请输入账号和密码")
     try:
-        session_id, session = sessions.create(base_url, apikey)
+        session_id, session = sessions.create(base_url, username, body.password, remember=body.remember)
+    except credentials.CredentialStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"无法保持登录：{exc}") from exc
     except oa.OAError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"无法连接 OA：{exc}") from exc
-    profile = session.profile
-    return {
-        "session_id": session_id,
-        "user": {
-            "userId": profile.get("userId"),
-            "userName": profile.get("userName"),
-            "employeeId": profile.get("employeeId"),
-            "employeeName": profile.get("employeeName"),
-            "lawfirmName": profile.get("lawfirmName"),
-        },
-    }
+    if not body.remember:
+        automation.disable(session.username)
+    return {"session_id": session_id, "user": _user_payload(session)}
+
+
+@app.post("/api/login/restore")
+def api_restore_login() -> dict[str, Any]:
+    try:
+        restored = sessions.restore(DEFAULT_BASE_URL)
+    except credentials.CredentialStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"无法读取保持登录信息：{exc}") from exc
+    except oa.OAError as exc:
+        raise HTTPException(status_code=401, detail=f"保持登录已失效：{exc}") from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"无法连接 OA：{exc}") from exc
+    if restored is None:
+        raise HTTPException(status_code=401, detail="没有可恢复的登录")
+    session_id, session = restored
+    return {"session_id": session_id, "user": _user_payload(session)}
 
 
 @app.post("/api/logout")
 def api_logout(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
-    sessions.drop(x_session_id)
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="缺少当前会话，无法退出登录")
+    try:
+        session = sessions.peek(x_session_id)
+        if session is not None:
+            automation.disable(session.username)
+        else:
+            saved = credentials.load_last_login()
+            if saved is not None:
+                automation.disable(saved.username)
+        sessions.drop(x_session_id, forget_login=True)
+    except credentials.CredentialStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"无法清除保持登录信息：{exc}") from exc
     return {"ok": True}
 
 
@@ -134,26 +193,6 @@ def api_case_detail(
 
 # ------------------------------------------------------------- documents
 
-# HOME 可能被启动环境重定向（同 assistant.REAL_HOME 的坑），文书固定落真实桌面。
-# Windows 下桌面可能被重定向（如用户目录在 D 盘、桌面在 C 盘），必须查注册表 Shell Folders
-def _desktop_dir() -> Path:
-    if os.name == "nt":
-        try:
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
-            ) as key:
-                desktop = Path(winreg.QueryValueEx(key, "Desktop")[0])
-                if desktop.is_dir():
-                    return desktop
-        except OSError:
-            pass
-    return assistant.REAL_HOME / "Desktop"
-
-
-DOC_DOWNLOAD_ROOT = _desktop_dir() / "文书下载"
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"|?*\\/]')
 
 
@@ -174,6 +213,13 @@ def _unique_path(path: Path) -> Path:
 
 class DocDownloadBody(BaseModel):
     templates: list[str]
+    target_dir: str
+
+
+@app.post("/api/cases/documents/pick-directory")
+def api_document_pick_directory(session: sessions.Session = Depends(require_session)) -> dict[str, str | None]:
+    directory = dialogs.choose_directory("选择文书保存位置")
+    return {"path": str(directory) if directory else None}
 
 
 @app.get("/api/cases/{lawcase_id}/documents/templates")
@@ -217,8 +263,9 @@ def api_case_doc_download(
 
     additions, notes = oa.companion_documents(detail, available, names)
     case_no = str(detail.get("no") or detail.get("preNo") or lawcase_id)
-    target_dir = DOC_DOWNLOAD_ROOT / _safe_filename(case_no)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = Path(body.target_dir).expanduser()
+    if not target_dir.is_absolute() or not target_dir.is_dir():
+        raise HTTPException(status_code=422, detail="请选择有效的文书保存目录")
 
     saved: list[dict[str, Any]] = []
     for name in names + additions:
@@ -248,7 +295,7 @@ def api_case_doc_download(
 
 
 @app.get("/api/approvals/pending")
-def api_pending(session: sessions.Session = Depends(require_session)) -> dict[str, Any]:
+def api_pending(session: sessions.Session = Depends(require_approval_session)) -> dict[str, Any]:
     filing = oa_call(
         oa.get_case_list, session.base_url, session.token, {"status": 1, "pageIndex": 0, "pageSize": 100}
     )
@@ -264,7 +311,7 @@ def api_pending(session: sessions.Session = Depends(require_session)) -> dict[st
 @app.get("/api/approvals/{lawcase_id}/check")
 def api_approval_check(
     lawcase_id: int,
-    session: sessions.Session = Depends(require_session),
+    session: sessions.Session = Depends(require_approval_session),
 ) -> dict[str, Any]:
     detail = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
     review = oa_call(oa.build_approval_review, session.base_url, session.token, lawcase_id, detail)
@@ -285,11 +332,43 @@ class RejectBody(BaseModel):
     memo: str
 
 
+class AutomationBody(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/approvals/automation")
+def api_automation_status(
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, Any]:
+    return automation.status(session.username)
+
+
+@app.post("/api/approvals/automation")
+def api_automation_set(
+    body: AutomationBody,
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, Any]:
+    try:
+        return automation.set_enabled(session, body.enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/approvals/automation/check-now")
+def api_automation_check_now(
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, Any]:
+    try:
+        return automation.run_once(session)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/api/approvals/{lawcase_id}/approve")
 def api_approve(
     lawcase_id: int,
     body: ApproveBody,
-    session: sessions.Session = Depends(require_session),
+    session: sessions.Session = Depends(require_approval_session),
 ) -> dict[str, Any]:
     detail = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
     old_status = oa.row_status(detail)
@@ -315,6 +394,24 @@ def api_approve(
     if body.risk_memo.strip():
         memo = f"{memo}\n风险收费复核：{body.risk_memo.strip()}".strip()
 
+    fresh = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
+    fresh_status = oa.row_status(fresh)
+    if fresh_status != 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"审批前案件状态已变为 {fresh.get('statusName')}（{fresh_status}），本次未写入",
+        )
+    fresh_review = oa_call(
+        oa.build_approval_review, session.base_url, session.token, lawcase_id, fresh
+    )
+    fresh_gate_errors = oa.approval_gate_errors(
+        fresh_review,
+        conflict_reviewed=body.conflict_reviewed,
+        conflict_memo=body.conflict_memo,
+        risk_reviewed=body.risk_reviewed,
+    )
+    if fresh_gate_errors:
+        raise HTTPException(status_code=409, detail={"gate_errors": fresh_gate_errors})
     oa_call(oa.post_lian_approval, session.base_url, session.token, lawcase_id, True, memo)
     after = oa_call(oa.verify_status_change, session.base_url, session.token, lawcase_id, 3)
     return {
@@ -331,7 +428,7 @@ def api_approve(
 def api_reject(
     lawcase_id: int,
     body: RejectBody,
-    session: sessions.Session = Depends(require_session),
+    session: sessions.Session = Depends(require_approval_session),
 ) -> dict[str, Any]:
     memo = body.memo.strip()
     if not memo:
@@ -440,7 +537,12 @@ def api_assistant_reveal(body: RevealBody, session: sessions.Session = Depends(r
 
 # ------------------------------------------------------------- static SPA
 
-_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if getattr(sys, "frozen", False):
+    # PyInstaller places explicitly bundled frontend assets next to the
+    # extracted application modules, not three source-tree levels above them.
+    _DIST = Path(sys._MEIPASS) / "frontend" / "dist"  # type: ignore[attr-defined]
+else:
+    _DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 if _DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
 

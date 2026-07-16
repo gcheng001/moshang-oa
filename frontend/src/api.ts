@@ -1,5 +1,6 @@
 import type {
   ApprovalReview,
+  AutomationStatus,
   AssistantJob,
   AssistantOverview,
   CaseListResponse,
@@ -11,22 +12,15 @@ import type {
 } from "./types";
 
 const SESSION_KEY = "moshang_session_id";
-const USER_KEY = "moshang_user";
-const APIKEY_MEMO = "moshang_apikey_memo";
+let currentUser: User | null = null;
 
 export function savedUser(): User | null {
-  const raw = localStorage.getItem(USER_KEY);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as User;
-  } catch {
-    return null;
-  }
+  return currentUser;
 }
 
 export function clearSession() {
-  localStorage.removeItem(SESSION_KEY);
-  localStorage.removeItem(USER_KEY);
+  sessionStorage.removeItem(SESSION_KEY);
+  currentUser = null;
 }
 
 export class ApiError extends Error {
@@ -40,23 +34,23 @@ export class ApiError extends Error {
   }
 }
 
-// 后端会话是内存态，APP 重开后旧 session 必然失效；
-// 若本机记住了 API Key，则在 401 时静默重登一次并重试原请求。
+function setSession(sessionId: string, user: User) {
+  sessionStorage.setItem(SESSION_KEY, sessionId);
+  currentUser = user;
+}
+
+// 后端会话是内存态；只有用户选择“保持登录”时，后端才能从操作系统凭据库恢复。
 let reloginPromise: Promise<boolean> | null = null;
 
 async function silentRelogin(): Promise<boolean> {
-  const apikey = localStorage.getItem(APIKEY_MEMO);
-  if (!apikey) return false;
   try {
-    const resp = await fetch("/api/login", {
+    const resp = await fetch("/api/login/restore", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apikey }),
     });
     if (!resp.ok) return false;
     const data = (await resp.json()) as { session_id: string; user: User };
-    localStorage.setItem(SESSION_KEY, data.session_id);
-    localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+    setSession(data.session_id, data.user);
     return true;
   } catch {
     return false;
@@ -68,7 +62,7 @@ async function request<T>(path: string, init?: RequestInit, retried = false): Pr
     "Content-Type": "application/json",
     ...(init?.headers as Record<string, string> | undefined),
   };
-  const sessionId = localStorage.getItem(SESSION_KEY);
+  const sessionId = sessionStorage.getItem(SESSION_KEY);
   if (sessionId) headers["X-Session-Id"] = sessionId;
 
   const resp = await fetch(path, { ...init, headers });
@@ -106,14 +100,27 @@ async function request<T>(path: string, init?: RequestInit, retried = false): Pr
 }
 
 export const api = {
-  async login(apikey: string): Promise<User> {
+  async login(username: string, password: string, remember: boolean): Promise<User> {
     const data = await request<{ session_id: string; user: User }>("/api/login", {
       method: "POST",
-      body: JSON.stringify({ apikey }),
+      body: JSON.stringify({ username, password, remember }),
     });
-    localStorage.setItem(SESSION_KEY, data.session_id);
-    localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+    setSession(data.session_id, data.user);
     return data.user;
+  },
+
+  async restoreLogin(): Promise<User> {
+    const resp = await fetch("/api/login/restore", { method: "POST" });
+    if (!resp.ok) throw new ApiError(resp.status, "没有可恢复的登录");
+    const data = (await resp.json()) as { session_id: string; user: User };
+    setSession(data.session_id, data.user);
+    return data.user;
+  },
+
+  async currentUser(): Promise<User> {
+    const user = await request<User>("/api/me");
+    currentUser = user;
+    return user;
   },
 
   async logout(): Promise<void> {
@@ -140,10 +147,14 @@ export const api = {
     return request(`/api/cases/${id}/documents/templates`);
   },
 
-  caseDocDownload(id: number, templates: string[]): Promise<DocDownloadResponse> {
+  documentPickDirectory(): Promise<{ path: string | null }> {
+    return request("/api/cases/documents/pick-directory", { method: "POST" });
+  },
+
+  caseDocDownload(id: number, templates: string[], target_dir: string): Promise<DocDownloadResponse> {
     return request(`/api/cases/${id}/documents/download`, {
       method: "POST",
-      body: JSON.stringify({ templates }),
+      body: JSON.stringify({ templates, target_dir }),
     });
   },
 
@@ -170,6 +181,18 @@ export const api = {
 
   reject(id: number, memo: string): Promise<{ ok: boolean; case_no: string; new_status_name: string }> {
     return request(`/api/approvals/${id}/reject`, { method: "POST", body: JSON.stringify({ memo }) });
+  },
+
+  automationStatus(): Promise<AutomationStatus> {
+    return request("/api/approvals/automation");
+  },
+
+  automationSet(enabled: boolean): Promise<AutomationStatus> {
+    return request("/api/approvals/automation", { method: "POST", body: JSON.stringify({ enabled }) });
+  },
+
+  automationCheckNow(): Promise<{ shadow: boolean; count: number }> {
+    return request("/api/approvals/automation/check-now", { method: "POST" });
   },
 
   // ---------------------------------------------------------- 办案助手

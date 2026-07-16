@@ -1,0 +1,54 @@
+delivery_handoff:
+  outcome: "交付可在 Windows 托盘长期值守的办公助手：账号显式开启后每十分钟检查待审案件，经全所排他租约协调，执行可审计的自动通过、最多两次自动驳回或转人工；首次上线锁定三天影子模式，并通过 Codex Sites 提供公开下载和用户确认式应用更新。"
+  artifacts:
+    - "/Users/Apple/Codex/摩尚OA/docs/plans/automatic-approval-watcher.md"
+    - "/Users/Apple/Codex/摩尚OA/CONTEXT-MAP.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/contexts/oa/CONTEXT.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0002-risk-fee-automation-reviews-clauses-only.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0003-windows-always-on-approval-watcher.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0004-single-firm-wide-automation-writer.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0005-shared-approval-coordination-service.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0006-cloudflare-coordinator-at-approval-subdomain.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0007-paired-device-authentication.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0008-auditable-automatic-approval-actions.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0009-codex-sites-download-portal-and-prompted-updates.md"
+    - "/Users/Apple/Codex/摩尚OA/docs/adr/0010-account-password-login-with-system-vault.md"
+  acceptance:
+    - "自动审批默认关闭，切换账号后不继承授权。"
+    - "全所同一时刻只有一个账号设备组合能够自动写入，租约十分钟失效并支持强制接管。"
+    - "明确通过才自动通过，明确阻断才自动驳回，未知或人工项转人工；同一驳回指纹最多自动驳回两次。"
+    - "风险代理只审 OA 条款；明确利冲需要可靠主体标识、对立方向和在办案件三项同时成立。"
+    - "OA 意见与协调服务使用同一审计编号，协调服务不保存当事人姓名或案件正文。"
+    - "三天影子运行和审批人手动确认完成前不存在自动 OA 写入。"
+    - "approval.gaodazhuang.top 的 Worker、D1、HTTPS、设备配对、租约并发和审计接口通过验证。"
+    - "Codex Sites 可公开下载当前 Windows 安装包和版本说明，应用发现新版本后校验安装包并在用户确认后更新。"
+    - "公开下载站使用 Codex Sites 自带生产地址，本阶段不新增域名购买费用；任何平台出现付费确认时停止执行。"
+    - "原案件看板入口统一更名为案件列表；下载案件文书前必须选择保存目录，取消选择时不产生文件。"
+    - "用户使用 OA 账号密码登录；只有显式开启保持登录并将密码存入操作系统凭据库的审批账号才能开启自动审批，浏览器存储不得包含账号密码或 API Key。"
+    - "审批入口按 OA 实际审批权限显示：无权限账号隐藏入口并停止待审轮询，直接访问审批地址时前后端均拒绝；不得按姓名或职位硬编码。"
+  out_of_scope:
+    - "结案审批。"
+    - "风险代理合同或告知材料真实性检查。"
+    - "多个自动写入端并行处理全所待审队列。"
+    - "Windows OCR、微信录屏取证和证据整理工具链。"
+    - "未经用户确认的静默或强制更新。"
+    - "未经另行授权的 GitHub 推送、PR 和 Windows 真机安装。"
+  repository: "/Users/Apple/Codex/摩尚OA"
+  target_branch: "codex/automatic-approval-watcher"
+  checks:
+    - "backend/.venv/bin/python -m pytest"
+    - "frontend/node_modules/.bin/tsc --noEmit"
+    - "cd frontend && npm run build"
+    - "协调服务单元测试与租约并发测试"
+    - "wrangler deploy --dry-run"
+    - "Windows 安装包构建与真机冒烟测试"
+  authority:
+    local_build: true
+    package: true
+    install: false
+    push: false
+    pull_request: false
+    publish: true
+    deploy: true
+  routing_overrides: {}
+  budget_overrides: {}

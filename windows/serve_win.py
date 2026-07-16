@@ -2,20 +2,19 @@
 
 启动本地 FastAPI 后端（端口 8017），然后用 Edge 应用模式打开独立窗口
 （--app：无地址栏无标签页，观感与桌面应用一致，Win10/11 自带 Edge）。
-窗口关闭后后端随之退出。异常写入 logs/moshang_win.log。
+关闭主窗口后保留系统托盘常驻：自动审批仍按账号开关和 10 分钟周期运行。
+仅从托盘「退出办公助手」才停止本地后端。异常写入 logs/moshang_win.log。
 """
 
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
 import traceback
 from pathlib import Path
-from urllib.request import urlopen
 
 HOST = "127.0.0.1"
 PORT = 8017
@@ -31,6 +30,8 @@ else:
     PKG_ROOT = _HERE
 LOG_DIR = PKG_ROOT / "logs"
 sys.path.insert(0, str(BACKEND_DIR))
+
+from app.local_server import is_expected_backend, port_in_use, wait_for_expected_backend
 
 # pythonw（双击、无控制台）下 sys.stdout/stderr 为 None，
 # uvicorn 配置日志时调 sys.stdout.isatty() 会直接崩 —— 接到日志文件兜底
@@ -49,11 +50,6 @@ def log(message: str) -> None:
         fp.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
 
 
-def port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        return sock.connect_ex((HOST, port)) == 0
-
-
 def run_server() -> None:
     try:
         import uvicorn
@@ -63,19 +59,6 @@ def run_server() -> None:
         # pythonw 无控制台，后端线程异常必须落日志，否则只见"启动超时"不见病因
         log("后端线程异常：\n" + traceback.format_exc())
         raise
-
-
-# 首次运行时 Defender 实时扫描新解压的数百个 pyd/py 文件，导入可能远超 20 秒，
-# 放宽到 90 秒避免冷启动误判超时（正常启动 1-3 秒，不受影响）
-def wait_ready(timeout: float = 90.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            urlopen(f"http://{HOST}:{PORT}/", timeout=1)
-            return
-        except Exception:
-            time.sleep(0.3)
-    raise RuntimeError("后端启动超时，详见 logs/moshang_win.log")
 
 
 def find_edge() -> Path | None:
@@ -143,29 +126,89 @@ def open_native_window(url: str) -> bool:
     webview.create_window(APP_TITLE, url, width=1360, height=860, min_size=(960, 640))
     threading.Thread(target=_apply_window_icon, daemon=True).start()
     log("用原生窗口（WebView2）打开")
-    # private_mode=False + storage_path：localStorage 持久化（记住的 API Key 不丢）
+    # 保留独立 WebView 资料目录，避免与日常浏览器资料混用。
     webview.start(private_mode=False, storage_path=str(PKG_ROOT / "webview-profile"))
-    log("窗口已关闭，退出")
+    log("主窗口已关闭，转为托盘常驻")
     return True
+
+
+def _open_in_edge(url: str) -> None:
+    edge = find_edge()
+    if edge is None:
+        import webbrowser
+
+        webbrowser.open(url)
+        return
+    profile = PKG_ROOT / "edge-profile"
+    subprocess.Popen(
+        [
+            str(edge), f"--app={url}", f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check", "--window-size=1360,860",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def start_tray(url: str) -> threading.Thread | None:
+    """Keep a visible, user-controllable process after the main window closes."""
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+    except Exception:
+        log("系统托盘组件不可用，自动审批将在主窗口关闭后停止：\n" + traceback.format_exc())
+        return None
+
+    icon_path = _find_icon()
+    if icon_path:
+        image = Image.open(icon_path)
+    else:
+        image = Image.new("RGBA", (64, 64), (79, 70, 229, 255))
+        ImageDraw.Draw(image).rectangle((18, 18, 46, 46), fill=(255, 255, 255, 255))
+
+    def open_app(_icon, _item) -> None:
+        _open_in_edge(url)
+
+    def exit_app(icon, _item) -> None:
+        log("用户从系统托盘退出办公助手")
+        icon.stop()
+        os._exit(0)
+
+    icon = pystray.Icon(
+        "MoshangOA", image, APP_TITLE,
+        menu=pystray.Menu(pystray.MenuItem("打开办公助手", open_app, default=True), pystray.MenuItem("退出办公助手", exit_app)),
+    )
+    thread = threading.Thread(target=icon.run, name="office-assistant-tray", daemon=False)
+    thread.start()
+    log("系统托盘已启动；关闭主窗口后自动审批继续运行")
+    return thread
 
 
 def main() -> None:
     log("启动器开始运行")
-    if not port_in_use(PORT):
+    if not port_in_use(HOST, PORT):
         threading.Thread(target=run_server, daemon=True).start()
         log("后端线程已拉起")
+    elif not is_expected_backend(HOST, PORT):
+        raise RuntimeError(f"端口 {PORT} 已被其他程序占用，请关闭占用程序后重试")
     else:
-        log("端口 8017 已有后端在跑，直接复用")
-    wait_ready()
+        log("已识别到同版本办公助手后端，直接复用")
+    # Defender 首次扫描便携包可能很慢，Windows 冷启动最多等待 90 秒。
+    wait_for_expected_backend(HOST, PORT, timeout=90.0)
     log("后端就绪")
 
     url = f"http://{HOST}:{PORT}/"
+    tray = start_tray(url)
     if open_native_window(url):
+        if tray is None:
+            return
+        # Keep FastAPI and its scheduler alive until the user explicitly exits from the tray.
+        tray.join()
         return
     edge = find_edge()
     if edge is not None:
         # 独立 user-data-dir：①强制新开 Edge 进程，窗口关闭时本脚本才能感知退出；
-        # ②localStorage（记住的 API Key）独立持久化，不与日常浏览混用
+        # ②独立资料目录，不与日常浏览混用
         profile = PKG_ROOT / "edge-profile"
         log(f"用 Edge 应用模式打开窗口：{edge}")
         subprocess.run(
@@ -179,7 +222,9 @@ def main() -> None:
             ],
             check=False,
         )
-        log("窗口已关闭，退出")
+        log("窗口已关闭，托盘继续常驻")
+        if tray is not None:
+            tray.join()
     else:
         import webbrowser
 

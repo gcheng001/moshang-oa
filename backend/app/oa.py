@@ -76,6 +76,47 @@ def login(base_url: str, api_key: str) -> str:
     return token
 
 
+def login_with_password(base_url: str, username: str, password: str) -> tuple[str, dict[str, Any]]:
+    """Use the OA web login endpoint and request a token for local API calls."""
+    url = urljoin(base_url.rstrip("/") + "/", "Account/Login")
+    resp = _http.post(
+        url,
+        data={
+            "userName": username,
+            "password": password,
+            "ajax": "true",
+            "app": "Default",
+            "forAccessToken": "true",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    token = (data or {}).get("AccessToken")
+    if not token:
+        raise OAError(str((data or {}).get("LoginFailedMessage") or "账号或密码不正确"))
+    return str(token), data if isinstance(data, dict) else {}
+
+
+def get_login_info(base_url: str, token: str) -> dict[str, Any]:
+    url = urljoin(base_url.rstrip("/") + "/", "Account/GetLoginInfo")
+    resp = _http.get(url, headers={"nedev_access_token": token}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise OAError(f"Account/GetLoginInfo 返回异常：{data!r}")
+    return data
+
+
+def has_filing_approval_permission(login_info: dict[str, Any]) -> bool:
+    """Mirror the live LawcaseList.page InitiateApprove menu authorization."""
+    if login_info.get("IsAdmin") is True:
+        return True
+    permissions = login_info.get("MenuPermissions") or {}
+    keys = permissions.keys() if isinstance(permissions, dict) else permissions
+    return "LawcaseList1" in keys
+
+
 def agent_get(base_url: str, token: str, action: str, params: dict[str, Any] | None = None) -> Any:
     url = urljoin(base_url.rstrip("/") + "/", f"DataServices/AgentAPI/{action}")
     resp = _http.get(url, headers={"nedev_access_token": token}, params=params or {}, timeout=30)
@@ -258,8 +299,7 @@ def get_case_detail(base_url: str, token: str, lawcase_id: int) -> dict[str, Any
 
 
 def get_case_entity(base_url: str, token: str, lawcase_id: int, detail: dict[str, Any]) -> dict[str, Any]:
-    base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
-    owners = ["Page:LawcaseDetails_刑事@1"] if "刑事" in base_type else ["Page:LawcaseDetails_民事@1"]
+    owners = ["Page:LawcaseDetails_刑事@1"] if is_criminal_case(detail) else ["Page:LawcaseDetails_民事@1"]
     result = post_form(
         base_url,
         token,
@@ -452,10 +492,39 @@ def cause_review(base_url: str, token: str, detail: dict[str, Any]) -> dict[str,
 
 # ------------------------------------------------------- approval reviews
 
+# 非诉讼业务类型：不按诉讼立案标准审查。这类业务没有诉讼阶段，收费灵活（含免费
+# 咨询），故不强制「案件阶段」、不作 5000 元低收费门槛审查。baseTypeName 是 OA
+# 案件基础大类，2026-07-10 全所 3468 件实证分布确认（咨询代书/顾问签约/非诉/公益）。
+NON_LITIGATION_BASE_TYPES = {"咨询代书", "顾问签约", "非诉业务", "公益法律"}
 
-def completeness_review(detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+
+def is_non_litigation(detail: dict[str, Any]) -> bool:
+    return (detail.get("baseTypeName") or "") in NON_LITIGATION_BASE_TYPES
+
+
+def is_criminal_case(detail: dict[str, Any]) -> bool:
+    classifications = (
+        detail.get("baseTypeName"),
+        detail.get("baseType"),
+        detail.get("caseCategoryName"),
+    )
+    if any("刑事" in str(value or "") for value in classifications):
+        return True
+
+    # OA 允许刑事法律援助案件登记在「公益法律」等业务大类下，此时规范
+    # 罪名才是案件性质的可靠信号。
+    cause = str(detail.get("causeAction") or detail.get("caseHeadName") or "").strip()
+    return cause.endswith("罪")
+
+
+def completeness_review(
+    detail: dict[str, Any],
+    entity: dict[str, Any],
+    *,
+    non_litigation: bool = False,
+    criminal_case: bool = False,
+) -> dict[str, Any]:
     principals, opponents = party_names(detail)
-    missing = []
     # 案情摘要缺失不拦截（2026-07-08 合伙人确认），只作提示
     checks = {
         "委托人": principals,
@@ -466,19 +535,46 @@ def completeness_review(detail: dict[str, Any], entity: dict[str, Any]) -> dict[
         "收费方式": detail.get("chargeMethodName") or entity.get("chargeMethd"),
         "委托收费金额": detail.get("chargeAmount"),
     }
-    for label, value in checks.items():
-        if value in (None, "", []):
-            missing.append(label)
+    if non_litigation:
+        # 非诉讼业务无诉讼阶段，不要求「案件阶段」
+        checks.pop("案件阶段", None)
+    if criminal_case:
+        # 刑事案件无民事/行政相对方，不要求「对方」
+        checks.pop("对方", None)
+    missing = [label for label, value in checks.items() if value in (None, "", [])]
     warnings = []
     if detail.get("caseSummary") in (None, ""):
         warnings.append("案情摘要未填写（不影响通过）")
-    return {"result": "blocked" if missing else "complete", "missing": missing, "warnings": warnings}
+    if non_litigation:
+        warnings.append("本案为非诉讼业务，已放宽审查：不要求案件阶段、不作低收费门槛审查")
+    if criminal_case:
+        warnings.append("本案为刑事案件，已放宽审查：不要求对方当事人")
+    return {
+        "result": "blocked" if missing else "complete",
+        "missing": missing,
+        "warnings": warnings,
+        "non_litigation": non_litigation,
+        "criminal_case": criminal_case,
+    }
 
 
-def fee_explanation_review(detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
-    """低收费审查：委托收费低于 5000 元必须有收费说明（ChargeMemo），否则不能通过。"""
+def fee_explanation_review(
+    detail: dict[str, Any], entity: dict[str, Any], *, non_litigation: bool = False
+) -> dict[str, Any]:
+    """低收费审查：委托收费低于 5000 元必须有收费说明（ChargeMemo），否则不能通过。
+
+    非诉讼业务（咨询代书/顾问签约等）收费灵活、可能免费，不适用此门槛。
+    """
     amount = decimal_value(detail.get("chargeAmount"))
     memo = str(entity.get("ChargeMemo") or "").strip()
+    if non_litigation:
+        return {
+            "result": "not_applicable",
+            "amount": float(amount) if amount is not None else None,
+            "memo": memo or None,
+            "non_litigation": True,
+            "note": "非诉讼业务不适用低收费门槛审查",
+        }
     if amount is None or amount >= Decimal("5000"):
         return {"result": "not_applicable", "amount": float(amount) if amount is not None else None, "memo": memo or None}
     if not memo:
@@ -678,9 +774,10 @@ def risk_cap_breakdown(subject_amount: Decimal) -> list[dict[str, Any]]:
 
 
 def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_amount: Any = None) -> dict[str, Any]:
-    """风险代理审查：列出收费方案，系统作初步合规判断并给建议，最终由合伙人人工确认。
+    """风险代理审查只核验 OA 中可机器读取的风险条款与收费数据。
 
-    2026-07-08 起不再硬阻断：所有问题作为初步判断意见呈现，通过前须合伙人勾选确认。
+    规则完整、未命中禁止范围且金额未超限时可以自动通过；任何资料外
+    判断（例如合同是否实际签署）都不会由自动审批代替人工判断。
     """
     if not is_risk_charge(detail, entity):
         return {"result": "not_applicable", "charge_method": detail.get("chargeMethodName")}
@@ -734,16 +831,16 @@ def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_
         suggestions.append("按方案各环节费用最高可能合计核算，超上限应要求调整方案")
 
     if not issues:
-        verdict = "preliminary_pass"
+        verdict = "pass"
         if cap is not None:
             suggestions.append(
-                f"初步符合规定。请人工核对收费方案中各环节费用合计的最高可能金额不超过 {cap:,.0f} 元，确认后通过"
+                f"OA 已登记的风险条款符合当前可核验规则，收费上限为 {cap:,.0f} 元"
             )
     else:
         verdict = "issues_found"
 
     return {
-        "result": "manual_confirmation_required",
+        "result": "auto_pass" if not issues else "manual_confirmation_required",
         "verdict": verdict,
         "charge_method": detail.get("chargeMethodName"),
         "scheme": scheme,
@@ -756,8 +853,8 @@ def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_
         "issues": issues,
         "suggestions": suggestions,
         "notes": [
-            "OA 登记收费金额可能仅为首期费用，不必然等于方案最高收费，请以收费方案原文为准",
-            "通过前请同时确认：已签专门书面风险代理合同，且已醒目告知风险代理含义、禁止范围与最高收费限制",
+            "系统只使用 OA 已登记的收费方案与金额；缺失、矛盾或无法核验时一律转人工",
+            "是否签署专门书面合同等材料事实不在自动审批范围内",
         ],
         "basis": "司发通〔2021〕87号第四至七项",
     }
@@ -771,16 +868,20 @@ def build_approval_review(
     risk_fee_amount: float | None = None,
 ) -> dict[str, Any]:
     entity = get_case_entity(base_url, token, lawcase_id, detail)
+    non_lit = is_non_litigation(detail)
+    criminal = is_criminal_case(detail)
     return {
         "lawcase_id": lawcase_id,
         "case_no": detail.get("no") or detail.get("preNo"),
         "status": detail.get("status"),
         "status_name": detail.get("statusName"),
-        "completeness": completeness_review(detail, entity),
+        "base_type_name": detail.get("baseTypeName"),
+        "non_litigation": non_lit,
+        "completeness": completeness_review(detail, entity, non_litigation=non_lit, criminal_case=criminal),
         "cause": cause_review(base_url, token, detail),
         "conflict": conflict_review(base_url, token, detail, lawcase_id),
         "duplicate_filing": duplicate_filing_review(base_url, token, detail, lawcase_id),
-        "fee_explanation": fee_explanation_review(detail, entity),
+        "fee_explanation": fee_explanation_review(detail, entity, non_litigation=non_lit),
         "risk_charge": risk_charge_review(detail, entity, risk_fee_amount),
     }
 
