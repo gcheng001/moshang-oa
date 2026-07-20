@@ -24,6 +24,9 @@ edge-profile/
 .venv
 __pycache__
 
+# OMC runtime 状态目录（本机工具产物，不入库）
+.omc/
+
 # 旧版归档（体积大，不入库）
 _legacy/
 

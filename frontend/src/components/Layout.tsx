@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { Briefcase, ClipboardCheck, LayoutGrid, LogOut, Scale } from "lucide-react";
+import { Briefcase, ClipboardCheck, History, LayoutGrid, LogOut, Scale } from "lucide-react";
 import { api } from "../api";
 import type { User } from "../types";
 
 const NAV = [
   { to: "/cases", label: "案件列表", icon: LayoutGrid },
   { to: "/approvals", label: "案件审批", icon: ClipboardCheck, requiresApproval: true },
+  { to: "/history", label: "审批记录", icon: History, requiresApproval: true },
   { to: "/assistant", label: "办案助手", icon: Briefcase },
 ];
 

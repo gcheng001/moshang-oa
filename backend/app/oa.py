@@ -926,6 +926,30 @@ def post_lian_approval(base_url: str, token: str, lawcase_id: int, approved: boo
     return result
 
 
+def post_lian_fanshen(base_url: str, token: str, lawcase_id: int) -> Any:
+    """反审批：将已通过(3)或已驳回(2)的立案申请退回立案待审(1)。
+
+    OA 端点为 JSON body（区别于 Lianshenpi 的表单编码），成功返回字符串 "1"。
+    """
+    url = urljoin(base_url.rstrip("/") + "/", "DataServices/LawcaseSvr/LianFanshen")
+    resp = _http.post(
+        url,
+        headers={"nedev_access_token": token},
+        json={"lawcaseIds": str(lawcase_id)},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    try:
+        result = resp.json()
+    except ValueError:
+        result = resp.text
+    if isinstance(result, str) and result.strip() == "1":
+        return result
+    if isinstance(result, dict) and (result.get("Type") or result.get("Message")):
+        raise OAError(result.get("Message") or json.dumps(result, ensure_ascii=False))
+    raise OAError(f"反审失败：{result!r}")
+
+
 def verify_status_change(base_url: str, token: str, lawcase_id: int, expected_status: int) -> dict[str, Any]:
     after: dict[str, Any] = {}
     for _ in range(5):

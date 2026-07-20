@@ -195,6 +195,16 @@ export const api = {
     return request("/api/approvals/automation/check-now", { method: "POST" });
   },
 
+  approvalHistory(): Promise<{ events: AutomationStatus["events"] }> {
+    return request("/api/approvals/history");
+  },
+
+  unapprove(
+    id: number,
+  ): Promise<{ ok: boolean; case_no: string; new_status_name: string }> {
+    return request(`/api/approvals/${id}/unapprove`, { method: "POST" });
+  },
+
   // ---------------------------------------------------------- 办案助手
   assistantOverview(): Promise<AssistantOverview> {
     return request("/api/assistant/overview");

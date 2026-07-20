@@ -39,6 +39,16 @@ export interface PendingResponse {
   closing: CaseRow[];
 }
 
+export interface ApprovalEvent {
+  at: string;
+  kind: string;
+  case_id?: number;
+  case_no?: string;
+  action?: string;
+  reasons?: string[];
+  message?: string;
+}
+
 export interface AutomationStatus {
   enabled: boolean;
   mode: "shadow" | "active";
@@ -46,15 +56,7 @@ export interface AutomationStatus {
   poll_minutes: number;
   last_checked_at: string | null;
   last_error: string | null;
-  events: {
-    at: string;
-    kind: string;
-    case_id?: number;
-    case_no?: string;
-    action?: string;
-    reasons?: string[];
-    message?: string;
-  }[];
+  events: ApprovalEvent[];
 }
 
 export interface ConflictFinding {

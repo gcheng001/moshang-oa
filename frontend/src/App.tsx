@@ -7,6 +7,7 @@ import { Login } from "./pages/Login";
 import { CaseBoard } from "./pages/CaseBoard";
 import { Approvals } from "./pages/Approvals";
 import { ApprovalDetail } from "./pages/ApprovalDetail";
+import { ApprovalHistory } from "./pages/ApprovalHistory";
 import { Assistant } from "./pages/Assistant";
 
 export default function App() {
@@ -34,6 +35,7 @@ export default function App() {
             <Route path="/cases" element={<CaseBoard />} />
             <Route path="/approvals" element={user.canApprove ? <Approvals /> : <NoApprovalAccess />} />
             <Route path="/approvals/:id" element={user.canApprove ? <ApprovalDetail /> : <NoApprovalAccess />} />
+            <Route path="/history" element={user.canApprove ? <ApprovalHistory /> : <NoApprovalAccess />} />
             <Route path="/assistant" element={<Assistant />} />
             <Route path="*" element={<Navigate to="/cases" replace />} />
           </Route>

@@ -364,6 +364,48 @@ def api_automation_check_now(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.get("/api/approvals/history")
+def api_approval_history(
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, Any]:
+    return {"events": automation.history(session.username)}
+
+
+@app.post("/api/approvals/{lawcase_id}/unapprove")
+def api_unapprove(
+    lawcase_id: int,
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, Any]:
+    detail = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
+    old_status = oa.row_status(detail)
+    if old_status not in (2, 3):
+        raise HTTPException(
+            status_code=409,
+            detail=f"该案件当前状态为 {detail.get('statusName')}（{old_status}），只有已通过或已驳回的立案申请可以反审",
+        )
+    case_no = detail.get("no") or detail.get("preNo")
+    oa_call(oa.post_lian_fanshen, session.base_url, session.token, lawcase_id)
+    after = oa_call(oa.verify_status_change, session.base_url, session.token, lawcase_id, 1)
+    automation.record_event(
+        session.username,
+        {
+            "kind": "un_approve",
+            "case_id": lawcase_id,
+            "case_no": after.get("no") or after.get("preNo") or case_no,
+            "action": "unapprove",
+            "message": f"反审：{detail.get('statusName')} → {after.get('statusName')}",
+        },
+    )
+    return {
+        "ok": True,
+        "action": "unapprove",
+        "lawcase_id": lawcase_id,
+        "case_no": after.get("no") or after.get("preNo") or case_no,
+        "new_status": after.get("status"),
+        "new_status_name": after.get("statusName"),
+    }
+
+
 @app.post("/api/approvals/{lawcase_id}/approve")
 def api_approve(
     lawcase_id: int,
@@ -414,6 +456,16 @@ def api_approve(
         raise HTTPException(status_code=409, detail={"gate_errors": fresh_gate_errors})
     oa_call(oa.post_lian_approval, session.base_url, session.token, lawcase_id, True, memo)
     after = oa_call(oa.verify_status_change, session.base_url, session.token, lawcase_id, 3)
+    automation.record_event(
+        session.username,
+        {
+            "kind": "manual_approve",
+            "case_id": lawcase_id,
+            "case_no": after.get("no") or after.get("preNo"),
+            "action": "approve",
+            "message": f"人工通过：{after.get('statusName')}",
+        },
+    )
     return {
         "ok": True,
         "action": "approve",
@@ -442,6 +494,16 @@ def api_reject(
         )
     oa_call(oa.post_lian_approval, session.base_url, session.token, lawcase_id, False, memo)
     after = oa_call(oa.verify_status_change, session.base_url, session.token, lawcase_id, 2)
+    automation.record_event(
+        session.username,
+        {
+            "kind": "manual_reject",
+            "case_id": lawcase_id,
+            "case_no": after.get("no") or after.get("preNo"),
+            "action": "reject",
+            "message": f"人工驳回：{memo}",
+        },
+    )
     return {
         "ok": True,
         "action": "reject",

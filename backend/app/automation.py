@@ -110,6 +110,22 @@ def status(username: str) -> dict[str, Any]:
         }
 
 
+def record_event(username: str, event: dict[str, Any]) -> None:
+    """记录一条事件（人工审批/驳回/反审等），供审批记录页查看。"""
+    with _lock:
+        state = _read()
+        account = _account(state, username)
+        _record(account, event)
+        _write(state)
+
+
+def history(username: str, limit: int = 100) -> list[dict[str, Any]]:
+    """返回最新在前的事件列表（默认最多 100 条）。"""
+    with _lock:
+        account = _account(_read(), username)
+        return list(reversed(_events(account, limit=limit)))
+
+
 def set_enabled(session: sessions.Session, enabled: bool) -> dict[str, Any]:
     if enabled and not credentials.has_password(session.username):
         raise ValueError("请先勾选“保持登录”，自动审批才能在 Windows 常驻运行")
