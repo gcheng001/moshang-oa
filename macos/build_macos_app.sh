@@ -14,13 +14,17 @@ echo "==> 1/4 Build frontend"
 (cd "$ROOT/frontend" && npm run build >/dev/null)
 
 echo "==> 2/4 Check packaging dependencies"
-"$PY" -c 'import PyInstaller, webview, keyring' 2>/dev/null || {
-  echo "Missing PyInstaller/webview/keyring in backend/.venv" >&2
+"$PY" -c 'import PyInstaller, webview, keyring, pystray, PIL, cryptography' 2>/dev/null || {
+  echo "Missing PyInstaller/webview/keyring/pystray/Pillow/cryptography in backend/.venv" >&2
   exit 1
 }
 
 echo "==> 3/4 Build universal local app"
-rm -rf "$DIST" "$WORK"
+BACKUPS="$(dirname "$ROOT")/.build-backups/摩尚OA/macos"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUPS"
+[ ! -e "$DIST" ] || mv "$DIST" "$BACKUPS/dist-$STAMP"
+[ ! -e "$WORK" ] || mv "$WORK" "$BACKUPS/work-$STAMP"
 mkdir -p "$DIST" "$WORK"
 cd "$ROOT/backend"
 "$PY" -m PyInstaller --noconfirm --clean --windowed --onedir \
@@ -30,6 +34,9 @@ cd "$ROOT/backend"
   --add-data "$ROOT/frontend/dist:frontend/dist" \
   --collect-all webview \
   --collect-all keyring \
+  --collect-all cryptography \
+  --collect-all pystray \
+  --collect-all PIL \
   --osx-bundle-identifier "com.moshang.oa" \
   --distpath "$DIST" --workpath "$WORK/work" --specpath "$WORK/spec" \
   "$ROOT/backend/desktop.py"
@@ -43,6 +50,11 @@ if /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Contents/Info.plist
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
 else
   /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist"
+fi
+if /usr/libexec/PlistBuddy -c "Print :LSMultipleInstancesProhibited" "$APP/Contents/Info.plist" >/dev/null 2>&1; then
+  /usr/libexec/PlistBuddy -c "Set :LSMultipleInstancesProhibited true" "$APP/Contents/Info.plist"
+else
+  /usr/libexec/PlistBuddy -c "Add :LSMultipleInstancesProhibited bool true" "$APP/Contents/Info.plist"
 fi
 # This is a local test build, so use an ad-hoc signature after modifying the
 # bundle metadata. Distribution outside this Mac will later need Developer ID

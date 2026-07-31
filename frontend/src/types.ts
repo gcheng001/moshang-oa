@@ -47,13 +47,25 @@ export interface ApprovalEvent {
   action?: string;
   reasons?: string[];
   message?: string;
+  oa_submitted_at?: string | null;
+  approval_time?: string | null;
+  decision_completed_at?: string | null;
+  rule_version?: string;
+  device_name?: string;
+  platform?: string;
 }
 
 export interface AutomationStatus {
   enabled: boolean;
+  paused: boolean;
   mode: "shadow" | "active";
   shadow_remaining_seconds: number;
   poll_minutes: number;
+  grace_seconds: number;
+  rule_version: string;
+  consecutive_failures: number;
+  device_name: string;
+  platform: string;
   last_checked_at: string | null;
   last_error: string | null;
   events: ApprovalEvent[];
@@ -152,6 +164,12 @@ export interface ApprovalReview {
     warnings: string[];
     non_litigation?: boolean;
     criminal_case?: boolean;
+    technical_errors?: string[];
+  };
+  system_options?: {
+    result: string;
+    blockers: string[];
+    technical_errors: string[];
   };
   cause: {
     result: string;

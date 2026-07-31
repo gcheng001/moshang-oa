@@ -163,7 +163,7 @@ export const api = {
   },
 
   approvalCheck(id: number): Promise<ApprovalReview> {
-    return request(`/api/approvals/${id}/check`);
+    return request(`/api/approvals/case/${id}/check`);
   },
 
   approve(
@@ -191,12 +191,32 @@ export const api = {
     return request("/api/approvals/automation", { method: "POST", body: JSON.stringify({ enabled }) });
   },
 
+  automationPause(paused: boolean): Promise<AutomationStatus> {
+    return request("/api/approvals/automation/pause", { method: "POST", body: JSON.stringify({ paused }) });
+  },
+
   automationCheckNow(): Promise<{ shadow: boolean; count: number }> {
     return request("/api/approvals/automation/check-now", { method: "POST" });
   },
 
   approvalHistory(): Promise<{ events: AutomationStatus["events"] }> {
     return request("/api/approvals/history");
+  },
+
+  notificationStatus(): Promise<{ configured: boolean }> {
+    return request("/api/approvals/notifications");
+  },
+
+  notificationSet(webhook: string): Promise<{ configured: boolean }> {
+    return request("/api/approvals/notifications", { method: "POST", body: JSON.stringify({ webhook }) });
+  },
+
+  credentialsExport(): Promise<{ code: string; bundle: string; filename: string }> {
+    return request("/api/credentials/export", { method: "POST" });
+  },
+
+  credentialsImport(bundle: string, code: string): Promise<{ ok: boolean; username: string; feishu_configured: boolean }> {
+    return request("/api/credentials/import", { method: "POST", body: JSON.stringify({ bundle, code }) });
   },
 
   unapprove(

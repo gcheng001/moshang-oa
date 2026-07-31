@@ -1,27 +1,30 @@
-"""Account-bound automatic filing approval with a deliberately safe shadow mode.
+"""Account-bound, auditable automatic filing approval.
 
-The scheduler runs only for a remembered, approval-capable account.  It never
-uses browser storage and records every candidate/action locally.  The first
-three days are shadow-only: the exact same rules run, but OA is not written.
+Only status=1 filing applications are handled. Business-rule failures are
+rejected with complete reasons; transport/read failures never cause rejection
+and are retried on the next three-minute poll.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
+import platform
+import socket
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import credentials, oa, sessions
+from . import credentials, notifications, oa, sessions
 
-POLL_SECONDS = 10 * 60
-SHADOW_SECONDS = 3 * 24 * 60 * 60
+POLL_SECONDS = 3 * 60
+GRACE_SECONDS = 2 * 60
+TECHNICAL_ALERT_THRESHOLD = 3
+RULE_VERSION = "2026.07.29-v2"
 STATE_DIR = Path.home() / ".office-assistant"
 STATE_FILE = STATE_DIR / "approval-automation.json"
-MAX_AUTO_REJECTIONS_PER_FINGERPRINT = 2
 
 _lock = threading.RLock()
 _run_lock = threading.Lock()
@@ -34,16 +37,14 @@ def _now() -> str:
 
 
 def _default_state() -> dict[str, Any]:
-    return {"version": 1, "accounts": {}}
+    return {"version": 2, "accounts": {}}
 
 
 def _read() -> dict[str, Any]:
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) and isinstance(data.get("accounts"), dict) else _default_state()
-    except FileNotFoundError:
-        return _default_state()
-    except (OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
         return _default_state()
 
 
@@ -63,164 +64,149 @@ def _write(state: dict[str, Any]) -> None:
 
 
 def _account(state: dict[str, Any], username: str) -> dict[str, Any]:
-    accounts = state.setdefault("accounts", {})
-    value = accounts.setdefault(username, {})
+    value = state.setdefault("accounts", {}).setdefault(username, {})
     value.setdefault("enabled", False)
-    value.setdefault("shadow_started_at", None)
+    value.setdefault("paused", False)
     value.setdefault("last_checked_at", None)
     value.setdefault("last_error", None)
     value.setdefault("events", [])
-    value.setdefault("reject_counts", {})
+    value.setdefault("first_seen", {})
+    value.setdefault("consecutive_failures", 0)
+    value.setdefault("technical_alert_open", False)
     return value
 
 
-def _events(account: dict[str, Any], *, limit: int = 50) -> list[dict[str, Any]]:
+def _events(account: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
     events = account.get("events") or []
     return events[-limit:] if isinstance(events, list) else []
 
 
 def _record(account: dict[str, Any], event: dict[str, Any]) -> None:
-    events = account.setdefault("events", [])
-    events.append({"at": _now(), **event})
-    del events[:-100]
+    account.setdefault("events", []).append({"at": _now(), **event})
+    del account["events"][:-500]
 
 
-def _shadow_remaining(started_at: str | None) -> int:
-    if not started_at:
-        return SHADOW_SECONDS
-    try:
-        started = datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return SHADOW_SECONDS
-    return max(0, int(SHADOW_SECONDS - (time.time() - started)))
+def _device() -> dict[str, str]:
+    return {
+        "device_id": f"{uuid.getnode():012x}",
+        "device_name": socket.gethostname(),
+        "platform": platform.system(),
+    }
 
 
 def status(username: str) -> dict[str, Any]:
     with _lock:
         account = _account(_read(), username)
-        remaining = _shadow_remaining(account.get("shadow_started_at")) if account.get("enabled") else 0
         return {
             "enabled": bool(account.get("enabled")),
-            "mode": "shadow" if account.get("enabled") and remaining else "active",
-            "shadow_remaining_seconds": remaining,
+            "paused": bool(account.get("paused")),
+            "mode": "active",
+            "shadow_remaining_seconds": 0,
             "poll_minutes": POLL_SECONDS // 60,
+            "grace_seconds": GRACE_SECONDS,
+            "rule_version": RULE_VERSION,
+            "consecutive_failures": int(account.get("consecutive_failures") or 0),
             "last_checked_at": account.get("last_checked_at"),
             "last_error": account.get("last_error"),
-            "events": list(reversed(_events(account, limit=20))),
+            "events": list(reversed(_events(account, 30))),
+            **_device(),
         }
 
 
 def record_event(username: str, event: dict[str, Any]) -> None:
-    """记录一条事件（人工审批/驳回/反审等），供审批记录页查看。"""
     with _lock:
         state = _read()
         account = _account(state, username)
-        _record(account, event)
+        _record(account, {**_device(), **event})
         _write(state)
 
 
-def history(username: str, limit: int = 100) -> list[dict[str, Any]]:
-    """返回最新在前的事件列表（默认最多 100 条）。"""
+def history(username: str, limit: int = 500) -> list[dict[str, Any]]:
     with _lock:
-        account = _account(_read(), username)
-        return list(reversed(_events(account, limit=limit)))
+        return list(reversed(_events(_account(_read(), username), limit)))
 
 
 def set_enabled(session: sessions.Session, enabled: bool) -> dict[str, Any]:
     if enabled and not credentials.has_password(session.username):
-        raise ValueError("请先勾选“保持登录”，自动审批才能在 Windows 常驻运行")
-    if not enabled:
-        disable(session.username)
-        return status(session.username)
+        raise ValueError("请先勾选“保持登录”，自动审批才能在电脑后台持续运行")
     with _lock:
         state = _read()
         account = _account(state, session.username)
-        account["enabled"] = enabled
+        account["enabled"] = bool(enabled)
+        account["paused"] = False if enabled else account.get("paused", False)
         account["last_error"] = None
-        if enabled and not account.get("shadow_started_at"):
-            account["shadow_started_at"] = _now()
-            _record(account, {"kind": "automation_enabled", "message": "已开启：前三天仅模拟，不写入 OA"})
+        _record(
+            account,
+            {
+                **_device(),
+                "kind": "automation_enabled" if enabled else "automation_disabled",
+                "message": "已开启自动审批：每3分钟检查，业务异常自动驳回" if enabled else "已关闭自动审批",
+                "rule_version": RULE_VERSION,
+            },
+        )
+        _write(state)
+    return status(session.username)
+
+
+def set_paused(session: sessions.Session, paused: bool) -> dict[str, Any]:
+    with _lock:
+        state = _read()
+        account = _account(state, session.username)
+        if not account.get("enabled"):
+            raise ValueError("自动审批尚未开启")
+        account["paused"] = bool(paused)
+        _record(
+            account,
+            {
+                **_device(),
+                "kind": "automation_paused" if paused else "automation_resumed",
+                "message": "已紧急暂停，保留值守但不写入 OA" if paused else "已恢复自动审批",
+            },
+        )
         _write(state)
     return status(session.username)
 
 
 def disable(username: str) -> None:
-    """Fail-closed switch used by logout and non-remembered login flows."""
     with _lock:
         state = _read()
         account = _account(state, username)
-        was_enabled = bool(account.get("enabled"))
-        account["enabled"] = False
-        account["last_error"] = None
-        if was_enabled:
-            _record(account, {"kind": "automation_disabled", "message": "已关闭自动审批"})
+        if account.get("enabled"):
+            account["enabled"] = False
+            _record(account, {**_device(), "kind": "automation_disabled", "message": "已关闭自动审批"})
         _write(state)
 
 
-def _reject_fingerprint(review: dict[str, Any], lawcase_id: int) -> tuple[str, list[str]] | None:
-    conflict = review.get("conflict") or {}
-    duplicate = review.get("duplicate_filing") or {}
-    reasons = list(conflict.get("blockers") or []) + list(duplicate.get("blockers") or [])
-    if not reasons:
-        return None
-    # Counts belong to one materially identical submission, not merely to a
-    # common Chinese reason string that may occur in unrelated cases.
-    conflict_findings = [
-        {
-            key: finding.get(key)
-            for key in ("case_id", "matched_name", "relation", "severity")
-        }
-        for finding in conflict.get("findings") or []
-        if isinstance(finding, dict)
-    ]
-    duplicate_findings = [
-        {
-            key: finding.get(key)
-            for key in (
-                "case_id",
-                "relation",
-                "principal_overlap",
-                "opponent_overlap",
-                "cause_match",
-                "cause",
-            )
-        }
-        for finding in duplicate.get("findings") or []
-        if isinstance(finding, dict)
-    ]
-    evidence = {
-        "lawcase_id": lawcase_id,
-        "reasons": sorted(str(reason).strip() for reason in reasons),
-        "principals": sorted(str(name) for name in conflict.get("principals") or []),
-        "opponents": sorted(str(name) for name in conflict.get("opponents") or []),
-        "conflict_findings": conflict_findings,
-        "duplicate_findings": duplicate_findings,
-    }
-    raw = json.dumps(evidence, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], reasons
+def _decision(review: dict[str, Any], *_args: Any) -> tuple[str, str, list[str]]:
+    technical = oa.approval_technical_errors(review)
+    if technical:
+        return "technical_error", "", technical
+    hard = list(dict.fromkeys(oa.approval_hard_errors(review)))
+    if hard:
+        return "reject", "", hard
+    manual_items = oa.approval_manual_review_items(review)
+    if manual_items:
+        return "manual_review", "", [item["summary"] for item in manual_items]
+    return "approve", "", ["全部适用的自动审批规则通过"]
 
 
-def _decision(review: dict[str, Any], account: dict[str, Any], lawcase_id: int) -> tuple[str, str, list[str]]:
-    """Return approve/reject/manual and an auditable reason.
+def _submitted_at(row: dict[str, Any], detail: dict[str, Any]) -> str | None:
+    for source in (detail, row):
+        for key in ("submitTime", "approvalSubmitTime", "createTime", "shouliDate"):
+            value = source.get(key)
+            if value:
+                return str(value)
+    return None
 
-    Only objectively confirmed active conflict/duplicate blockers can reject.
-    Everything incomplete, ambiguous or requiring human judgement remains manual.
-    """
-    fingerprint = _reject_fingerprint(review, lawcase_id)
-    if fingerprint:
-        key, reasons = fingerprint
-        count = int((account.get("reject_counts") or {}).get(key, 0))
-        if count < MAX_AUTO_REJECTIONS_PER_FINGERPRINT:
-            return "reject", key, reasons
-        return "manual", key, ["同一冲突已自动驳回两次，第三次转人工"] + reasons
-    errors = oa.approval_gate_errors(review)
-    if errors:
-        return "manual", "", errors
-    return "approve", "", ["全部可机器核验的审批规则通过"]
+
+def _notify_safely(message: str) -> None:
+    try:
+        notifications.send_feishu(message)
+    except Exception:
+        pass
 
 
 def run_once(session: sessions.Session) -> dict[str, Any]:
-    """Run one serialized check and reject duplicate UI/background invocations."""
     if not _run_lock.acquire(blocking=False):
         raise ValueError("自动审批检查正在进行，请稍后再试")
     try:
@@ -230,140 +216,186 @@ def run_once(session: sessions.Session) -> dict[str, Any]:
 
 
 def _run_once(session: sessions.Session) -> dict[str, Any]:
-    """Run a single poll. This is callable from the UI's “立即检查” button."""
     with _lock:
-        state = _read()
-        account = _account(state, session.username)
+        account = _account(_read(), session.username)
         if not account.get("enabled"):
             raise ValueError("自动审批尚未开启")
-        shadow = _shadow_remaining(account.get("shadow_started_at")) > 0
+        if account.get("paused"):
+            raise ValueError("自动审批已紧急暂停")
 
     rows: list[dict[str, Any]] = []
     page_index = 0
     while True:
         payload = oa.get_case_list(
-            session.base_url,
-            session.token,
-            {"status": 1, "pageIndex": page_index, "pageSize": 100},
+            session.base_url, session.token, {"status": 1, "pageIndex": page_index, "pageSize": 100}
         )
         batch = [row for row in payload.get("data") or [] if isinstance(row, dict)]
         rows.extend(batch)
-        try:
-            total = int(payload.get("total") or 0)
-        except (TypeError, ValueError):
-            total = 0
+        total = int(payload.get("total") or 0)
         if len(batch) < 100 or (total and len(rows) >= total):
             break
         page_index += 1
+
+    pending_ids = {str(oa.row_case_id(row)) for row in rows if oa.row_case_id(row)}
+    with _lock:
+        state = _read()
+        account = _account(state, session.username)
+        first_seen = account.setdefault("first_seen", {})
+        for stale in set(first_seen) - pending_ids:
+            first_seen.pop(stale, None)
+        _write(state)
+
     results: list[dict[str, Any]] = []
-    failures: list[str] = []
+    technical_failures: list[str] = []
     for row in rows:
         lawcase_id = oa.row_case_id(row)
         if not lawcase_id:
             continue
-        detail = oa.get_case_detail(session.base_url, session.token, lawcase_id)
-        if oa.row_status(detail) != 1:
-            continue
-        review = oa.build_approval_review(session.base_url, session.token, lawcase_id, detail)
+        case_key = str(lawcase_id)
         with _lock:
             state = _read()
             account = _account(state, session.username)
-            action, fingerprint, reasons = _decision(review, account, lawcase_id)
-            case_no = detail.get("no") or detail.get("preNo") or str(lawcase_id)
-            event = {"kind": "candidate", "case_id": lawcase_id, "case_no": case_no, "action": action, "reasons": reasons}
-            if shadow:
-                event["kind"] = "shadow_candidate"
-                event["message"] = "观察期：未写入 OA"
+            first_seen = account.setdefault("first_seen", {})
+            seen = first_seen.get(case_key)
+            if not seen:
+                seen = {"at": _now(), "epoch": time.time()}
+                first_seen[case_key] = seen
+                event = {
+                    **_device(), "kind": "waiting_reread", "case_id": lawcase_id,
+                    "case_no": row.get("no") or row.get("preNo"),
+                    "oa_submitted_at": _submitted_at(row, row), "first_seen_at": seen["at"],
+                    "message": "已发现待审申请，等待2分钟后重新读取再审批",
+                }
                 _record(account, event)
                 _write(state)
                 results.append(event)
                 continue
-            if action == "manual":
-                event["message"] = "需要人工处理"
-                _record(account, event)
-                _write(state)
-                results.append(event)
+            if time.time() - float(seen.get("epoch") or 0) < GRACE_SECONDS:
                 continue
 
-        # The user may disable automation while a slow review is running.
-        # Recheck immediately before every write so the switch is fail-closed.
+        started = time.monotonic()
+        event: dict[str, Any] = {
+            **_device(), "case_id": lawcase_id, "case_no": row.get("no") or row.get("preNo"),
+            "oa_submitted_at": _submitted_at(row, row), "first_seen_at": seen.get("at"),
+            "rule_version": RULE_VERSION,
+        }
+        try:
+            detail = oa.get_case_detail(session.base_url, session.token, lawcase_id)
+            if oa.row_status(detail) != 1:
+                event.update(kind="status_changed", message="案件已不再是立案待审，本次未写入 OA")
+                results.append(event)
+                record_event(session.username, event)
+                continue
+            event["case_no"] = detail.get("no") or detail.get("preNo") or str(lawcase_id)
+            event["oa_submitted_at"] = _submitted_at(row, detail)
+            review = oa.build_approval_review(session.base_url, session.token, lawcase_id, detail)
+            action, _, reasons = _decision(review)
+        except Exception as exc:
+            reason = str(exc)
+            technical_failures.append(reason)
+            event.update(kind="technical_retry", reasons=[reason], message="技术异常，未驳回；下轮自动重试")
+            record_event(session.username, event)
+            results.append(event)
+            continue
+
+        if action == "technical_error":
+            technical_failures.extend(reasons)
+            event.update(kind="technical_retry", reasons=reasons, message="技术异常，未驳回；下轮自动重试")
+            record_event(session.username, event)
+            results.append(event)
+            continue
+
         with _lock:
-            state = _read()
-            account = _account(state, session.username)
-            if not account.get("enabled"):
-                event["kind"] = "automation_stopped"
-                event["message"] = "自动审批已关闭，本次检查停止且未写入 OA"
-                _record(account, event)
-                _write(state)
+            account = _account(_read(), session.username)
+            if not account.get("enabled") or account.get("paused"):
+                event.update(kind="automation_stopped", message="自动审批已关闭或暂停，本次未写入 OA")
+                record_event(session.username, event)
                 results.append(event)
                 break
 
-        # Review can involve several OA reads. Confirm the status again at the
-        # last safe moment to avoid racing a manual approver or another device.
-        fresh_detail = oa.get_case_detail(session.base_url, session.token, lawcase_id)
-        fresh_status = oa.row_status(fresh_detail)
-        if fresh_status != 1:
-            event["kind"] = "status_changed"
-            event["message"] = f"案件状态已变为 {fresh_detail.get('statusName')}（{fresh_status}），未写入 OA"
-            with _lock:
-                state = _read()
-                account = _account(state, session.username)
-                _record(account, event)
-                _write(state)
-            results.append(event)
-            continue
-
-        fresh_review = oa.build_approval_review(
-            session.base_url, session.token, lawcase_id, fresh_detail
-        )
-        with _lock:
-            state = _read()
-            account = _account(state, session.username)
-            fresh_decision = _decision(fresh_review, account, lawcase_id)
-        if fresh_decision != (action, fingerprint, reasons):
-            event["kind"] = "review_changed"
-            event["message"] = "审批资料或核验结果在检查期间发生变化，已留待下次重新判断"
-            with _lock:
-                state = _read()
-                account = _account(state, session.username)
-                _record(account, event)
-                _write(state)
-            results.append(event)
-            continue
-
-        # Network write intentionally happens outside the state lock, then is read-back verified by oa.py.
-        memo = "[办公助手自动审批] " + "；".join(reasons)
         try:
-            oa.post_lian_approval(session.base_url, session.token, lawcase_id, action == "approve", memo)
-            oa.verify_status_change(session.base_url, session.token, lawcase_id, 3 if action == "approve" else 2)
-        except Exception as exc:
-            event["kind"] = "action_failed"
-            event["message"] = str(exc)
-            failures.append(str(exc))
-        else:
-            event["kind"] = "auto_" + action
-            event["message"] = "已写入 OA 并完成回读校验"
-            if action == "reject" and fingerprint:
+            fresh = oa.get_case_detail(session.base_url, session.token, lawcase_id)
+            if oa.row_status(fresh) != 1:
+                event.update(kind="status_changed", message="写入前状态已变化，本次未写入 OA")
+                record_event(session.username, event)
+                results.append(event)
+                continue
+            fresh_review = oa.build_approval_review(session.base_url, session.token, lawcase_id, fresh)
+            fresh_action, _, fresh_reasons = _decision(fresh_review)
+            if (fresh_action, fresh_reasons) != (action, reasons):
+                event.update(kind="review_changed", message="资料在复核期间发生变化，下轮重新判断")
+                record_event(session.username, event)
+                results.append(event)
+                continue
+            if action == "manual_review":
+                # 转人工：本次不写 OA，只落记录并清掉首次复读标记，避免下轮重复转人工
+                completed_at = _now()
+                event.update(
+                    kind="manual_review",
+                    action="manual_review",
+                    reasons=reasons,
+                    message="需人工复核，本次未写入 OA；请合伙人在「审批记录」中处理",
+                    decision_started_at=event.get("first_seen_at"),
+                    approval_time=completed_at,
+                    decision_completed_at=completed_at,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
                 with _lock:
                     state = _read()
-                    account = _account(state, session.username)
-                    counts = account.setdefault("reject_counts", {})
-                    counts[fingerprint] = int(counts.get(fingerprint, 0)) + 1
+                    _account(state, session.username).setdefault("first_seen", {}).pop(case_key, None)
                     _write(state)
-        with _lock:
-            state = _read()
-            account = _account(state, session.username)
-            _record(account, event)
-            _write(state)
+                _notify_safely(f"办公助手转人工：{event['case_no']}\n" + "\n".join(reasons))
+                record_event(session.username, event)
+                results.append(event)
+                continue
+            numbered = "；".join(f"{index + 1}. {reason}" for index, reason in enumerate(reasons))
+            memo = f"[办公助手自动审批][规则 {RULE_VERSION}] {numbered}"
+            oa.post_lian_approval(session.base_url, session.token, lawcase_id, action == "approve", memo)
+            after = oa.verify_status_change(session.base_url, session.token, lawcase_id, 3 if action == "approve" else 2)
+        except Exception as exc:
+            reason = str(exc)
+            technical_failures.append(reason)
+            event.update(kind="action_failed", reasons=[reason], message="OA 写入或回读失败，下轮自动重试")
+        else:
+            completed_at = _now()
+            event.update(
+                kind="auto_" + action,
+                action=action,
+                reasons=reasons,
+                message="已写入 OA 并完成回读校验",
+                decision_started_at=event.get("first_seen_at"),
+                approval_time=completed_at,
+                decision_completed_at=completed_at,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                new_status=after.get("status"),
+                new_status_name=after.get("statusName"),
+            )
+            with _lock:
+                state = _read()
+                _account(state, session.username).setdefault("first_seen", {}).pop(case_key, None)
+                _write(state)
+            _notify_safely(f"办公助手自动{'通过' if action == 'approve' else '驳回'}：{event['case_no']}\n{numbered}")
+        record_event(session.username, event)
         results.append(event)
 
     with _lock:
         state = _read()
         account = _account(state, session.username)
         account["last_checked_at"] = _now()
-        account["last_error"] = failures[-1] if failures else None
+        if technical_failures:
+            account["consecutive_failures"] = int(account.get("consecutive_failures") or 0) + 1
+            account["last_error"] = technical_failures[-1]
+            if account["consecutive_failures"] >= TECHNICAL_ALERT_THRESHOLD and not account.get("technical_alert_open"):
+                account["technical_alert_open"] = True
+                _notify_safely(f"办公助手连续 {account['consecutive_failures']} 轮出现技术异常，未对异常案件作出审批或驳回，请检查网络或 OA。")
+        else:
+            if account.get("technical_alert_open"):
+                _notify_safely("办公助手自动审批技术异常已恢复。")
+            account["consecutive_failures"] = 0
+            account["technical_alert_open"] = False
+            account["last_error"] = None
         _write(state)
-    return {"shadow": shadow, "count": len(results), "results": results}
+    return {"shadow": False, "count": len(results), "results": results}
 
 
 def _background() -> None:
@@ -371,8 +403,6 @@ def _background() -> None:
         try:
             saved = credentials.load_last_login()
         except credentials.CredentialStoreUnavailable:
-            # Keep the scheduler alive so a temporarily unavailable vault can
-            # recover on a later poll instead of killing the daemon thread.
             continue
         if not saved:
             continue
@@ -382,19 +412,28 @@ def _background() -> None:
             if restored is None:
                 continue
             session_id, session = restored
-            if not session.can_approve or not status(session.username)["enabled"]:
-                continue
-            run_once(session)
+            state = status(session.username)
+            if session.can_approve and state["enabled"] and not state["paused"]:
+                run_once(session)
         except Exception as exc:
             with _lock:
-                state = _read()
-                account = _account(state, saved.username)
+                state_data = _read()
+                account = _account(state_data, saved.username)
+                account["consecutive_failures"] = int(account.get("consecutive_failures") or 0) + 1
                 account["last_error"] = str(exc)
-                _record(account, {"kind": "check_failed", "message": str(exc)})
-                _write(state)
+                _record(account, {"kind": "check_failed", "message": str(exc), **_device()})
+                should_alert = (
+                    account["consecutive_failures"] >= TECHNICAL_ALERT_THRESHOLD
+                    and not account.get("technical_alert_open")
+                )
+                if should_alert:
+                    account["technical_alert_open"] = True
+                _write(state_data)
+            if should_alert:
+                _notify_safely(
+                    f"办公助手连续 {account['consecutive_failures']} 轮无法完成待审扫描，未对案件作出审批或驳回：{exc}"
+                )
         finally:
-            # Background restore is ephemeral; retaining its random session id
-            # would leak password/token-bearing Session objects every poll.
             sessions.drop(session_id)
 
 

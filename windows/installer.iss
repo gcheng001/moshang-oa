@@ -4,7 +4,7 @@
 
 #define MyAppName "办公助手"
 #define MyAppNameASCII "MoshangOA"
-#define MyAppVersion "2.1.1"
+#define MyAppVersion "2.3.0"
 #define MyAppPublisher "摩尚律师事务所"
 #define MyAppExeName "办公助手"
 
@@ -41,6 +41,10 @@ Source: "dist\MoshangOA-Win\*"; DestDir: "{app}"; Flags: recursesubdirs createal
 
 [Tasks]
 Name: "desktopicon"; Description: "在桌面创建快捷方式"; GroupDescription: "附加选项:"
+Name: "autostart"; Description: "登录 Windows 后自动启动并在系统托盘值守"; GroupDescription: "附加选项:"; Flags: checkedonce
+
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "MoshangOfficeAssistant"; ValueData: """{app}\python\pythonw.exe"" ""{app}\app\backend\serve_win.py"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Icons]
 ; 开始菜单 - 主入口（pythonw 无控制台，日常体验干净）

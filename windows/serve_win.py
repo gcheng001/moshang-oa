@@ -2,7 +2,7 @@
 
 启动本地 FastAPI 后端（端口 8017），然后用 Edge 应用模式打开独立窗口
 （--app：无地址栏无标签页，观感与桌面应用一致，Win10/11 自带 Edge）。
-关闭主窗口后保留系统托盘常驻：自动审批仍按账号开关和 10 分钟周期运行。
+关闭主窗口后保留系统托盘常驻：自动审批仍按账号开关和 3 分钟周期运行。
 仅从托盘「退出办公助手」才停止本地后端。异常写入 logs/moshang_win.log。
 """
 
@@ -74,6 +74,24 @@ def find_edge() -> Path | None:
 
 
 APP_TITLE = "办公助手"
+
+
+def ensure_autostart() -> None:
+    """Register this exact portable/install location for user-login startup."""
+    try:
+        import winreg
+
+        executable = Path(sys.executable)
+        pythonw = executable.with_name("pythonw.exe")
+        if not pythonw.is_file():
+            pythonw = executable
+        script = Path(__file__).resolve()
+        command = f'"{pythonw}" "{script}"'
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            winreg.SetValueEx(key, "MoshangOfficeAssistant", 0, winreg.REG_SZ, command)
+        log("已登记 Windows 登录自启动")
+    except Exception:
+        log("登记 Windows 登录自启动失败（不影响本次使用）：\n" + traceback.format_exc())
 
 
 def _find_icon() -> Path | None:
@@ -186,6 +204,7 @@ def start_tray(url: str) -> threading.Thread | None:
 
 def main() -> None:
     log("启动器开始运行")
+    ensure_autostart()
     if not port_in_use(HOST, PORT):
         threading.Thread(target=run_server, daemon=True).start()
         log("后端线程已拉起")

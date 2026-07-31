@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from app import credentials, main, oa, sessions
+from app import credential_handoff, credentials, main, oa, sessions
 
 
 class FakeKeyring:
@@ -23,6 +23,20 @@ class FakeKeyring:
 
 
 class AuthAndPermissionTests(unittest.TestCase):
+    def test_credential_handoff_is_encrypted_and_round_trips(self) -> None:
+        fake = FakeKeyring()
+        with patch("app.credentials._keyring", return_value=(fake, RuntimeError)):
+            credentials.save_password("lawyer", "top-secret")
+            credentials.save_feishu_webhook("https://open.feishu.cn/open-apis/bot/v2/hook/example")
+            code, bundle = credential_handoff.export_bundle()
+            self.assertNotIn("top-secret", bundle)
+            credentials.forget_password("lawyer")
+            credentials.save_feishu_webhook("")
+            username = credential_handoff.import_bundle(bundle, code)
+            self.assertEqual(username, "lawyer")
+            self.assertEqual(credentials.load_last_login().password, "top-secret")
+            self.assertTrue(credentials.load_feishu_webhook())
+
     def test_approval_permission_matches_oa_initiate_approve_menu(self) -> None:
         self.assertTrue(oa.has_filing_approval_permission({"MenuPermissions": {"LawcaseList1": None}}))
         self.assertTrue(oa.has_filing_approval_permission({"IsAdmin": True, "MenuPermissions": {}}))

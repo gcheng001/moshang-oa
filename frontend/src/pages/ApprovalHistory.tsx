@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bell,
   CheckCircle2,
+  Download,
   Loader2,
   RefreshCw,
   RotateCcw,
@@ -24,9 +25,13 @@ const KIND_META: Record<string, Meta> = {
   manual_reject: { label: "人工驳回", tone: "bg-red-50 text-red-700 ring-red-200", group: "decisions", Icon: XCircle },
   un_approve: { label: "反审撤回", tone: "bg-amber-50 text-amber-700 ring-amber-200", group: "decisions", Icon: RotateCcw },
   candidate: { label: "待处理", tone: "bg-zinc-100 text-zinc-600", group: "system", Icon: Bell },
+  waiting_reread: { label: "等待复读", tone: "bg-zinc-100 text-zinc-600", group: "system", Icon: Bell },
+  technical_retry: { label: "技术重试", tone: "bg-amber-50 text-amber-700 ring-amber-200", group: "system", Icon: Bell },
   shadow_candidate: { label: "观察期", tone: "bg-zinc-100 text-zinc-500", group: "system", Icon: Bell },
   automation_enabled: { label: "开启值守", tone: "bg-zinc-100 text-zinc-600", group: "system", Icon: ShieldCheck },
   automation_disabled: { label: "关闭值守", tone: "bg-zinc-100 text-zinc-600", group: "system", Icon: ShieldCheck },
+  automation_paused: { label: "紧急暂停", tone: "bg-amber-50 text-amber-700", group: "system", Icon: ShieldCheck },
+  automation_resumed: { label: "恢复值守", tone: "bg-emerald-50 text-emerald-700", group: "system", Icon: ShieldCheck },
   automation_stopped: { label: "值守中断", tone: "bg-zinc-100 text-zinc-500", group: "system", Icon: Bell },
   status_changed: { label: "状态已变", tone: "bg-zinc-100 text-zinc-500", group: "system", Icon: Bell },
   review_changed: { label: "资料变化", tone: "bg-zinc-100 text-zinc-500", group: "system", Icon: Bell },
@@ -61,6 +66,7 @@ export function ApprovalHistory() {
   const [error, setError] = useState<string | null>(null);
   const [target, setTarget] = useState<ApprovalEvent | null>(null);
   const [working, setWorking] = useState(false);
+  const [query, setQuery] = useState("");
 
   const load = useCallback(async (silent = false) => {
     if (silent) setRefreshing(true);
@@ -113,9 +119,27 @@ export function ApprovalHistory() {
   }, [events]);
 
   const visible = useMemo(() => {
-    if (filter === "all") return rows;
-    return rows.filter((r) => metaOf(r.ev.kind).group === filter);
-  }, [rows, filter]);
+    const filtered = filter === "all" ? rows : rows.filter((r) => metaOf(r.ev.kind).group === filter);
+    const needle = query.trim().toLowerCase();
+    if (!needle) return filtered;
+    return filtered.filter(({ ev }) => [ev.case_no, ev.message, ...(ev.reasons || []), ev.device_name, ev.rule_version].join(" ").toLowerCase().includes(needle));
+  }, [rows, filter, query]);
+
+  function exportCsv() {
+    const header = ["案件", "结果", "OA提交时间", "审批时间", "理由", "设备", "规则"];
+    const lines = visible.map(({ ev }) => [
+      ev.case_no || ev.case_id || "", metaOf(ev.kind).label, ev.oa_submitted_at || "",
+      ev.approval_time || ev.decision_completed_at || ev.at, (ev.reasons || []).join("；"),
+      `${ev.device_name || ""} ${ev.platform || ""}`.trim(), ev.rule_version || "",
+    ]);
+    const csv = [header, ...lines].map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `办公助手审批记录-${new Date().toISOString().slice(0, 10)}.csv`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
 
   async function doUnapprove() {
     if (!target?.case_id) return;
@@ -142,14 +166,17 @@ export function ApprovalHistory() {
           <h1 className="text-lg font-semibold text-zinc-900">审批记录</h1>
           <p className="mt-1 text-sm text-zinc-500">查看自动与人工审批的全部痕迹，可对已落地的立案决策进行反审。</p>
         </div>
-        <button
-          onClick={() => void load(true)}
-          disabled={refreshing}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium text-zinc-600 shadow-sm transition-colors hover:bg-zinc-50 disabled:opacity-50"
-        >
-          {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-          刷新
-        </button>
+        <div className="flex gap-2">
+          <button onClick={exportCsv} className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium text-zinc-600"><Download className="h-4 w-4" />导出 CSV</button>
+          <button
+            onClick={() => void load(true)}
+            disabled={refreshing}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium text-zinc-600 shadow-sm transition-colors hover:bg-zinc-50 disabled:opacity-50"
+          >
+            {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            刷新
+          </button>
+        </div>
       </header>
 
       <div className="mb-5 grid grid-cols-4 gap-3">
@@ -172,6 +199,7 @@ export function ApprovalHistory() {
           </button>
         ))}
       </div>
+      <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索案件、理由、设备或规则版本" className="mb-4 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm" />
 
       {error && (
         <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
@@ -215,6 +243,10 @@ export function ApprovalHistory() {
                       {ev.reasons && ev.reasons.length > 0 && (
                         <p className="text-xs text-zinc-400">依据：{ev.reasons.join("；")}</p>
                       )}
+                      {(ev.oa_submitted_at || ev.approval_time || ev.decision_completed_at) && (
+                        <p className="text-xs text-zinc-400">OA提交：{fmtTime(ev.oa_submitted_at || undefined)} · 审批：{fmtTime(ev.approval_time || ev.decision_completed_at || ev.at)}</p>
+                      )}
+                      {(ev.device_name || ev.rule_version) && <p className="text-xs text-zinc-400">设备：{ev.device_name || "—"} {ev.platform || ""} · 规则：{ev.rule_version || "—"}</p>}
                     </div>
                   )}
                 </div>

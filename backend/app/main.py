@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import assistant, automation, credentials, dialogs, oa, sessions
+from . import assistant, automation, credential_handoff, credentials, dialogs, notifications, oa, sessions
 from .local_server import APP_ID, APP_VERSION
 
 DEFAULT_BASE_URL = os.environ.get("MOSHANG_OA_BASE_URL", oa.DEFAULT_BASE_URL)
@@ -299,16 +299,13 @@ def api_pending(session: sessions.Session = Depends(require_approval_session)) -
     filing = oa_call(
         oa.get_case_list, session.base_url, session.token, {"status": 1, "pageIndex": 0, "pageSize": 100}
     )
-    closing = oa_call(
-        oa.get_case_list, session.base_url, session.token, {"status": 4, "pageIndex": 0, "pageSize": 100}
-    )
     return {
         "filing": filing.get("data") or [],
-        "closing": closing.get("data") or [],
+        "closing": [],
     }
 
 
-@app.get("/api/approvals/{lawcase_id}/check")
+@app.get("/api/approvals/case/{lawcase_id}/check")
 def api_approval_check(
     lawcase_id: int,
     session: sessions.Session = Depends(require_approval_session),
@@ -336,6 +333,19 @@ class AutomationBody(BaseModel):
     enabled: bool
 
 
+class PauseBody(BaseModel):
+    paused: bool
+
+
+class FeishuBody(BaseModel):
+    webhook: str = ""
+
+
+class CredentialImportBody(BaseModel):
+    bundle: str
+    code: str
+
+
 @app.get("/api/approvals/automation")
 def api_automation_status(
     session: sessions.Session = Depends(require_approval_session),
@@ -352,6 +362,63 @@ def api_automation_set(
         return automation.set_enabled(session, body.enabled)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/approvals/automation/pause")
+def api_automation_pause(
+    body: PauseBody,
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, Any]:
+    try:
+        return automation.set_paused(session, body.paused)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/approvals/notifications")
+def api_notification_status(
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, bool]:
+    return {"configured": bool(credentials.load_feishu_webhook())}
+
+
+@app.post("/api/approvals/notifications")
+def api_notification_set(
+    body: FeishuBody,
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, bool]:
+    webhook = body.webhook.strip()
+    if webhook and not webhook.startswith(("https://open.feishu.cn/", "https://open.larksuite.com/")):
+        raise HTTPException(status_code=422, detail="请输入飞书群自定义机器人的官方 Webhook 地址")
+    credentials.save_feishu_webhook(webhook)
+    if webhook:
+        try:
+            notifications.send_feishu("办公助手飞书通知已连接。未配置飞书时仍会正常自动审批。")
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"已保存，但测试通知失败：{exc}") from exc
+    return {"configured": bool(webhook)}
+
+
+@app.post("/api/credentials/export")
+def api_credentials_export(
+    session: sessions.Session = Depends(require_approval_session),
+) -> dict[str, str]:
+    try:
+        code, bundle = credential_handoff.export_bundle()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"code": code, "bundle": bundle, "filename": "办公助手凭据迁移.oacred"}
+
+
+@app.post("/api/credentials/import")
+def api_credentials_import(
+    body: CredentialImportBody,
+) -> dict[str, Any]:
+    try:
+        username = credential_handoff.import_bundle(body.bundle, body.code)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "username": username, "feishu_configured": bool(credentials.load_feishu_webhook())}
 
 
 @app.post("/api/approvals/automation/check-now")

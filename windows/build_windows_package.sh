@@ -27,12 +27,15 @@ fi
 echo "==> 3/6 解析并下载本次唯一的 win_amd64 依赖集"
 # 不能把历次解析结果混在一起解压；旧缓存曾同时含 anyio 4.14.1/4.14.2，
 # 会让最终运行环境取决于文件遍历顺序。pip 自身下载缓存仍会复用。
-rm -rf "$WHEELS"
+BACKUPS="$(dirname "$ROOT")/.build-backups/摩尚OA/windows"
+STAMP_FULL="$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUPS"
+[ ! -e "$WHEELS" ] || mv "$WHEELS" "$BACKUPS/wheels-$STAMP_FULL"
 mkdir -p "$WHEELS"
 "$PIP" download --quiet --dest "$WHEELS" \
   --platform win_amd64 --python-version "$PY_TAG" --implementation cp \
   --only-binary=:all: \
-  "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "colorama" "keyring>=25" \
+  "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "colorama" "keyring>=25" "cryptography>=43" \
   "pywin32-ctypes>=0.2"
 # pip evaluates pystray's macOS-only optional dependency against this Mac host
 # even when downloading Windows wheels, which makes its normal resolver fail.
@@ -53,7 +56,7 @@ mkdir -p "$WHEELS"
 "$PIP" wheel --quiet --no-deps --wheel-dir "$WHEELS" "proxy_tools==0.1.0"
 
 echo "==> 4/6 组装包目录"
-rm -rf "$PKG"
+[ ! -e "$PKG" ] || mv "$PKG" "$BACKUPS/package-$STAMP_FULL"
 mkdir -p "$PKG/python" "$PKG/app/backend" "$PKG/app/frontend"
 unzip -q "$EMBED_ZIP" -d "$PKG/python"
 # 开启 site-packages（内嵌版默认 ._pth 不含）
@@ -65,7 +68,6 @@ for whl in "$WHEELS"/*.whl; do
 done
 
 cp -R "$ROOT/backend/app" "$PKG/app/backend/app"
-find "$PKG/app/backend/app" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 cp "$ROOT/windows/serve_win.py" "$PKG/app/backend/serve_win.py"
 cp -R "$ROOT/frontend/dist" "$PKG/app/frontend/dist"
 cp "$ROOT/windows/start.bat" "$PKG/start.bat"
@@ -82,6 +84,7 @@ test -f "$SITE/fastapi/__init__.py" || { echo "缺 fastapi"; exit 1; }
 test -f "$SITE/uvicorn/__init__.py" || { echo "缺 uvicorn"; exit 1; }
 test -f "$SITE/requests/__init__.py" || { echo "缺 requests"; exit 1; }
 test -f "$SITE/keyring/__init__.py" || { echo "缺 keyring"; exit 1; }
+test -f "$SITE/cryptography/__init__.py" || { echo "缺 cryptography"; exit 1; }
 test -f "$SITE/pystray/__init__.py" || { echo "缺 pystray"; exit 1; }
 test -f "$SITE/webview/__init__.py" || { echo "缺 pywebview"; exit 1; }
 test -f "$SITE/pythonnet/__init__.py" || { echo "缺 pythonnet"; exit 1; }
@@ -106,9 +109,10 @@ PY
 
 echo "==> 6/6 压缩"
 STAMP="$(date +%Y%m%d)"
-ZIP="$OUT/MoshangOA-Win-$STAMP.zip"
-rm -f "$ZIP"
-(cd "$OUT" && zip -qr "$(basename "$ZIP")" "MoshangOA-Win")
+VERSION="$(PYTHONPATH="$ROOT/backend" "$ROOT/backend/.venv/bin/python" -c 'from app.local_server import APP_VERSION; print(APP_VERSION)')"
+ZIP="$OUT/MoshangOA-Win-$VERSION-$STAMP.zip"
+[ ! -e "$ZIP" ] || mv "$ZIP" "$BACKUPS/$(basename "$ZIP").$STAMP_FULL"
+(cd "$OUT" && zip -qr "$(basename "$ZIP")" "MoshangOA-Win" -x '*__pycache__*' '*.pyc')
 cp -f "$ZIP" "$HOME/Desktop/" 2>/dev/null || true
 echo "完成：$ZIP"
 du -sh "$ZIP" | awk '{print "包大小: " $1}'

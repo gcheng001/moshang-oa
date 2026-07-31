@@ -12,6 +12,8 @@ export function Login({ onLogin }: { onLogin: (user: User) => void }) {
   const [show, setShow] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [importBundle, setImportBundle] = useState("");
+  const [importCode, setImportCode] = useState("");
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -23,6 +25,21 @@ export function Login({ onLogin }: { onLogin: (user: User) => void }) {
     setError("");
     try {
       const user = await api.login(username.trim(), password, remember);
+      onLogin(user);
+      navigate("/cases", { replace: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const importCredentials = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      await api.credentialsImport(importBundle.trim(), importCode.trim());
+      const user = await api.restoreLogin();
       onLogin(user);
       navigate("/cases", { replace: true });
     } catch (err) {
@@ -95,6 +112,18 @@ export function Login({ onLogin }: { onLogin: (user: User) => void }) {
             {loading ? "登录中…" : "登 录"}
           </button>
         </form>
+
+        <div className="mt-3 rounded-xl border border-zinc-200 bg-white p-4 text-xs text-zinc-500">
+          <p className="font-medium text-zinc-700">从另一台电脑迁移登录</p>
+          <p className="mt-1">选择加密迁移文件并输入一次性迁移码，可同时导入 OA 登录和可选飞书机器人密钥。</p>
+          <div className="mt-3 space-y-2">
+            <input type="file" accept=".oacred,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (file) void file.text().then(setImportBundle); }} className="w-full" />
+            <div className="flex gap-2">
+              <input value={importCode} onChange={(event) => setImportCode(event.target.value)} placeholder="一次性迁移码" className="min-w-0 flex-1 rounded-lg border border-zinc-300 px-3 py-2" />
+              <button type="button" disabled={!importBundle || !importCode || loading} onClick={() => void importCredentials()} className="rounded-lg border border-indigo-200 px-3 py-2 font-medium text-indigo-700 disabled:opacity-40">导入并登录</button>
+            </div>
+          </div>
+        </div>
 
         <p className="mt-6 text-center text-[11px] text-zinc-300">© 2026 浙江摩尚律师事务所</p>
       </div>

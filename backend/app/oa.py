@@ -244,6 +244,34 @@ def format_amounts(amounts: list[Decimal]) -> str:
     return "、".join(f"{a:,.0f} 元" for a in amounts)
 
 
+# 收费方案中的比例条款：如"回款金额的30%""按15％收取""二八分成（律师20%）"
+_PERCENT_CLAUSE = re.compile(
+    r"(?P<context>[^，。；;、\n]{0,12}?)"
+    r"(?P<rate>[0-9]+(?:\.[0-9]+)?)\s*[%％]"
+)
+# 比例基数：用于按标的额估算比例收费的最高可能金额
+_PERCENT_BASE_HINTS = ("回款", "执行", "收回", "标的", "赔偿", "争议", "金额", "款项", "基数")
+
+
+def extract_percent_clauses(text: str) -> list[dict[str, Any]]:
+    """从收费方案文本提取比例收费条款（费率 + 前文语境）。"""
+    text = text or ""
+    clauses: list[dict[str, Any]] = []
+    for match in _PERCENT_CLAUSE.finditer(text):
+        rate = decimal_value(match.group("rate"))
+        if rate is None or rate <= 0 or rate > 100:
+            continue
+        context = (match.group("context") or "").strip()
+        clauses.append(
+            {
+                "rate": rate,
+                "context": context,
+                "on_recovery_basis": any(hint in context for hint in _PERCENT_BASE_HINTS),
+            }
+        )
+    return clauses
+
+
 def risk_fee_cap(subject_amount: Any) -> Decimal | None:
     """Graduated maximum fee under 司发通〔2021〕87号第六项."""
     amount = decimal_value(subject_amount)
@@ -299,19 +327,53 @@ def get_case_detail(base_url: str, token: str, lawcase_id: int) -> dict[str, Any
 
 
 def get_case_entity(base_url: str, token: str, lawcase_id: int, detail: dict[str, Any]) -> dict[str, Any]:
-    owners = ["Page:LawcaseDetails_刑事@1"] if is_criminal_case(detail) else ["Page:LawcaseDetails_民事@1"]
-    result = post_form(
-        base_url,
-        token,
-        "/DataService/GetEntity",
-        {
-            "entityType": "ApplicationData.Lawcase",
-            "entityKeys": json.dumps([lawcase_id]),
-            "owners": json.dumps(owners, ensure_ascii=False),
-        },
-    )
-    value = result.get("Value") if isinstance(result, dict) else None
-    return value if isinstance(value, dict) else {}
+    base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+    preferred: list[str] = []
+    if "刑事" in base_type:
+        preferred.append("Page:LawcaseDetails_刑事@1")
+    elif "行政" in base_type:
+        preferred.append("Page:LawcaseDetails_行政@1")
+    elif any(keyword in base_type for keyword in ("非诉", "顾问", "咨询", "代书", "公益")):
+        preferred.extend(
+            ["Page:LawcaseDetails_非诉@1", "Page:LawcaseDetails_法律顾问@1", "Page:LawcaseDetails_顾问@1"]
+        )
+    elif "仲裁" in base_type:
+        preferred.append("Page:LawcaseDetails_仲裁@1")
+    elif "执行" in base_type:
+        preferred.append("Page:LawcaseDetails_执行@1")
+    else:
+        preferred.append("Page:LawcaseDetails_民事@1")
+    owners = preferred + [
+        "Page:LawcaseDetails_民事@1", "Page:LawcaseDetails_刑事@1", "Page:LawcaseDetails_行政@1",
+        "Page:LawcaseDetails_非诉@1", "Page:LawcaseDetails_法律顾问@1", "Page:LawcaseDetails_顾问@1",
+        "Page:LawcaseDetails_仲裁@1", "Page:LawcaseDetails_执行@1", "Page:LawcaseDetails@1",
+    ]
+    seen: set[str] = set()
+    last_error: Exception | None = None
+    for owner in owners:
+        if owner in seen:
+            continue
+        seen.add(owner)
+        try:
+            result = post_form(
+                base_url,
+                token,
+                "/DataService/GetEntity",
+                {
+                    "entityType": "ApplicationData.Lawcase",
+                    "entityKeys": json.dumps([lawcase_id]),
+                    "owners": json.dumps([owner], ensure_ascii=False),
+                },
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        value = result.get("Value") if isinstance(result, dict) else None
+        if isinstance(value, dict) and value:
+            return value
+    if last_error is not None:
+        raise OAError(f"无法读取案件登记原始字段，稍后自动重试：{last_error}")
+    return {}
 
 
 def party_names(detail: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -495,11 +557,116 @@ def cause_review(base_url: str, token: str, detail: dict[str, Any]) -> dict[str,
 # 非诉讼业务类型：不按诉讼立案标准审查。这类业务没有诉讼阶段，收费灵活（含免费
 # 咨询），故不强制「案件阶段」、不作 5000 元低收费门槛审查。baseTypeName 是 OA
 # 案件基础大类，2026-07-10 全所 3468 件实证分布确认（咨询代书/顾问签约/非诉/公益）。
+CANONICAL_CASE_TYPES = (
+    "民事案件", "刑事案件", "行政案件", "执行案件", "顾问签约", "非诉业务",
+    "仲裁业务", "咨询代书", "赔偿案件", "破产案件（诉讼）", "公益法律",
+)
+LITIGATION_CASE_TYPES = {
+    "民事案件", "刑事案件", "行政案件", "执行案件", "仲裁业务",
+    "赔偿案件", "破产案件（诉讼）",
+}
 NON_LITIGATION_BASE_TYPES = {"咨询代书", "顾问签约", "非诉业务", "公益法律"}
+GENERIC_FEE_MEMOS = {"特殊情况", "情况特殊", "领导同意", "已沟通", "客户原因", "其他", "无", "暂无"}
+
+
+def normalized_case_type(detail: dict[str, Any]) -> str:
+    value = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+    aliases = (
+        (("顾问",), "顾问签约"), (("非诉",), "非诉业务"), (("仲裁",), "仲裁业务"),
+        (("咨询", "代书"), "咨询代书"), (("破产",), "破产案件（诉讼）"),
+        (("公益",), "公益法律"), (("赔偿",), "赔偿案件"), (("执行",), "执行案件"),
+        (("刑事",), "刑事案件"), (("行政",), "行政案件"), (("民事",), "民事案件"),
+    )
+    for needles, canonical in aliases:
+        if any(needle in value for needle in needles):
+            return canonical
+    return ""
 
 
 def is_non_litigation(detail: dict[str, Any]) -> bool:
-    return (detail.get("baseTypeName") or "") in NON_LITIGATION_BASE_TYPES
+    return normalized_case_type(detail) in NON_LITIGATION_BASE_TYPES
+
+
+def _first_value(detail: dict[str, Any], entity: dict[str, Any], *keys: str) -> Any:
+    for source in (detail, entity):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, "", []):
+                return value
+    return None
+
+
+def _meaningful_memo(value: Any) -> bool:
+    text = re.sub(r"\s+", "", str(value or ""))
+    return len(text) >= 4 and text not in GENERIC_FEE_MEMOS
+
+
+def _option_id(value: Any) -> Any:
+    if isinstance(value, dict):
+        for key in ("Id", "id", "ID", "value"):
+            candidate = value.get(key)
+            if candidate not in (None, ""):
+                return candidate
+        return None
+    if isinstance(value, (int, float)) and value:
+        return value
+    text = str(value or "").strip()
+    return text if text.isdigit() else None
+
+
+def _has_system_instance(detail: dict[str, Any], entity: dict[str, Any]) -> bool:
+    if _option_id(entity.get("currentInstance")) and _option_id(entity.get("currentInstanceRole")):
+        return True
+    instances = detail.get("instances")
+    if not isinstance(instances, list):
+        return False
+    for instance in instances:
+        if not isinstance(instance, dict) or not _option_id(instance):
+            continue
+        roles = instance.get("roles")
+        if isinstance(roles, list) and any(_option_id(role) for role in roles):
+            return True
+    return False
+
+
+def system_option_review(
+    base_url: str, token: str, detail: dict[str, Any], entity: dict[str, Any]
+) -> dict[str, Any]:
+    """核验案件分类、案由、阶段和收费方式均来自 OA 系统选项。"""
+    case_type = normalized_case_type(detail)
+    if not entity:
+        return {
+            "result": "technical_error",
+            "blockers": [],
+            "technical_errors": ["无法核验案件类型、案由、收费方式等是否来自 OA 系统选项"],
+        }
+    blockers: list[str] = []
+    technical_errors: list[str] = []
+    category_id = _option_id(entity.get("caseCategory") or detail.get("caseCategory") or detail.get("caseCategoryId"))
+    if not category_id:
+        blockers.append("案件分类不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
+    if case_type != "公益法律" and not _option_id(entity.get("chargeMethd") or detail.get("chargeMethodId")):
+        blockers.append("收费方式不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
+    if case_type in LITIGATION_CASE_TYPES and not _has_system_instance(detail, entity):
+        blockers.append("案件阶段或代理方不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
+    if case_type in LITIGATION_CASE_TYPES:
+        cause = str(detail.get("caseHeadName") or detail.get("causeAction") or "").strip()
+        linked_head = _option_id(entity.get("caseHead") or entity.get("caseHeadId") or detail.get("caseHeadId"))
+        if cause and not linked_head:
+            try:
+                match = _match_case_head(
+                    normalize_name(cause), get_case_heads(base_url, token), str(detail.get("baseTypeName") or "")
+                )
+            except Exception as exc:
+                technical_errors.append(f"无法核验案由是否来自 OA 系统选项：{exc}")
+            else:
+                if not match:
+                    blockers.append(f"案由“{cause}”不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
+    return {
+        "result": "technical_error" if technical_errors else ("blocked" if blockers else "ok"),
+        "blockers": blockers,
+        "technical_errors": technical_errors,
+    }
 
 
 def is_criminal_case(detail: dict[str, Any]) -> bool:
@@ -525,33 +692,78 @@ def completeness_review(
     criminal_case: bool = False,
 ) -> dict[str, Any]:
     principals, opponents = party_names(detail)
-    # 案情摘要缺失不拦截（2026-07-08 合伙人确认），只作提示
-    checks = {
-        "委托人": principals,
-        "对方": opponents,
-        "经办律师": detail.get("empNames") or detail.get("employees"),
-        "案由": detail.get("causeAction") or detail.get("caseHeadName"),
-        "案件阶段": detail.get("instances"),
-        "收费方式": detail.get("chargeMethodName") or entity.get("chargeMethd"),
-        "委托收费金额": detail.get("chargeAmount"),
-    }
-    if non_litigation:
-        # 非诉讼业务无诉讼阶段，不要求「案件阶段」
-        checks.pop("案件阶段", None)
-    if criminal_case:
-        # 刑事案件无民事/行政相对方，不要求「对方」
-        checks.pop("对方", None)
+    case_type = normalized_case_type(detail)
+    technical_errors = []
+    if not case_type:
+        technical_errors.append(f"无法识别 OA 案件类型：{detail.get('baseTypeName') or '空'}")
+    lawyer = detail.get("empNames") or detail.get("employees")
+    cause = detail.get("causeAction") or detail.get("caseHeadName")
+    instance = detail.get("instances") or _first_value(detail, entity, "currentInstance")
+    charge_method = detail.get("chargeMethodName") or entity.get("chargeMethd")
+    summary = _first_value(detail, entity, "caseSummary", "CaseSummary", "projectName", "serviceItem", "matterName", "服务事项")
+    checks: dict[str, Any] = {"经办律师": lawyer}
+    if case_type == "公益法律":
+        checks.update({"服务对象": principals, "公益事项": summary or cause})
+        amount = decimal_value(detail.get("chargeAmount"))
+        if amount is not None and amount > 0:
+            checks["公益法律不得登记收费金额"] = None
+    elif case_type == "顾问签约":
+        checks.update({
+            "客户名称": principals,
+            "顾问开始日期": _first_value(detail, entity, "serviceStartDate", "startDate", "contractStartDate", "GuWenStartDate"),
+            "顾问结束日期": _first_value(detail, entity, "serviceEndDate", "endDate", "contractEndDate", "GuWenEndDate"),
+            "收费方式": charge_method,
+        })
+    elif case_type == "非诉业务":
+        checks.update({"委托人": principals, "具体服务事项或项目名称": summary or cause, "收费方式": charge_method})
+    elif case_type == "咨询代书":
+        checks.update({"委托人": principals, "咨询事项或代书文书类型": summary or cause, "收费方式": charge_method})
+    elif case_type == "刑事案件":
+        checks.update({"委托人或实际服务对象": principals, "涉嫌罪名或案件事项": cause, "案件阶段及辩护或代理身份": instance, "收费方式": charge_method})
+    elif case_type == "执行案件":
+        checks.update({
+            "申请执行人": principals, "被执行人": opponents,
+            "执行依据或原审案号": _first_value(detail, entity, "originalCaseNo", "executionBasis", "caseSummary", "CaseSummary"),
+            "执行事项": cause or summary, "执行阶段": instance, "收费方式": charge_method,
+        })
+        if _first_value(detail, entity, "biaodi", "Biaodi", "executionAmount") in (None, "") and not _meaningful_memo(
+            _first_value(detail, entity, "caseMemo", "CaseMemo", "ChargeMemo")
+        ):
+            checks["申请执行金额或无金额事项具体说明"] = None
+    elif case_type == "仲裁业务":
+        checks.update({
+            "委托人": principals, "对方当事人": opponents, "仲裁争议事项或系统案由": cause,
+            "仲裁机构": _first_value(detail, entity, "arbitrationInstitution", "arbitrationCommission", "courtName"),
+            "代理阶段及代理方": instance, "收费方式": charge_method,
+        })
+    elif case_type == "赔偿案件":
+        checks.update({"委托人": principals, "赔偿义务机关或责任主体": opponents, "赔偿事项或系统案由": cause, "申请或诉讼阶段及代理身份": instance, "收费方式": charge_method})
+    elif case_type == "破产案件（诉讼）":
+        checks.update({
+            "委托人": principals, "债务人或主要相关主体": opponents,
+            "委托人身份": _first_value(detail, entity, "clientRole", "partyRole", "WTQXContent"),
+            "破产事项或系统案由": cause, "办理阶段及代理身份": instance, "收费方式": charge_method,
+        })
+    else:
+        checks.update({"委托人": principals, "对方": opponents, "案由": cause, "案件阶段及代理方": instance, "收费方式": charge_method})
     missing = [label for label, value in checks.items() if value in (None, "", [])]
     warnings = []
-    if detail.get("caseSummary") in (None, ""):
-        warnings.append("案情摘要未填写（不影响通过）")
+    if case_type != "公益法律":
+        free_method = str(charge_method or "")
+        if any(word in free_method for word in ("免费", "无偿", "公益", "法律援助", "减免")):
+            if not _meaningful_memo(_first_value(detail, entity, "caseMemo", "CaseMemo", "ChargeMemo")):
+                missing.append("无偿或减免费用的具体理由")
+        elif detail.get("chargeAmount") in (None, ""):
+            missing.append("委托收费金额")
     if non_litigation:
         warnings.append("本案为非诉讼业务，已放宽审查：不要求案件阶段、不作低收费门槛审查")
     if criminal_case:
         warnings.append("本案为刑事案件，已放宽审查：不要求对方当事人")
     return {
-        "result": "blocked" if missing else "complete",
+        "result": "technical_error" if technical_errors else ("blocked" if missing else "complete"),
+        "case_type": case_type,
         "missing": missing,
+        "technical_errors": technical_errors,
         "warnings": warnings,
         "non_litigation": non_litigation,
         "criminal_case": criminal_case,
@@ -577,12 +789,12 @@ def fee_explanation_review(
         }
     if amount is None or amount >= Decimal("5000"):
         return {"result": "not_applicable", "amount": float(amount) if amount is not None else None, "memo": memo or None}
-    if not memo:
+    if not _meaningful_memo(memo):
         return {
             "result": "blocked",
             "amount": float(amount),
             "memo": None,
-            "blockers": [f"委托收费 {amount} 元低于 5000 元且未填写收费说明，不能通过；请在 OA 补充收费说明后重新检查"],
+            "blockers": [f"委托收费 {amount} 元低于 5000 元，必须填写具体低收费理由，不能使用“特殊情况/领导同意”等笼统说明"],
         }
     memo_amounts = extract_fee_amounts(memo)
     if not fee_amounts_match(amount, memo_amounts):
@@ -778,6 +990,7 @@ def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_
 
     规则完整、未命中禁止范围且金额未超限时可以自动通过；任何资料外
     判断（例如合同是否实际签署）都不会由自动审批代替人工判断。
+    审批在先、签约在后：审批阶段不要求已登记合同或告知材料。
     """
     if not is_risk_charge(detail, entity):
         return {"result": "not_applicable", "charge_method": detail.get("chargeMethodName")}
@@ -818,6 +1031,7 @@ def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_
         suggestions.append("核对收费方案约定的最高可能收费，超上限应要求调整")
 
     scheme_amounts = extract_fee_amounts(scheme) if scheme else []
+    percent_clauses = extract_percent_clauses(scheme) if scheme else []
     if scheme_amounts and registered_fee is not None and not fee_amounts_match(registered_fee, scheme_amounts):
         issues.append(
             f"收费方案记载金额（{format_amounts(scheme_amounts)}）与 OA 登记收费 {registered_fee:,.0f} 元不一致，"
@@ -829,32 +1043,48 @@ def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_
             f"收费方案记载固定金额合计 {sum(scheme_amounts):,.0f} 元已超过分段上限 {cap:,.0f} 元（尚未计入比例收费部分）"
         )
         suggestions.append("按方案各环节费用最高可能合计核算，超上限应要求调整方案")
+    for clause in percent_clauses:
+        if not clause["on_recovery_basis"] or subject_amount is None or cap is None:
+            continue
+        variable_fee = (subject_amount * clause["rate"] / Decimal("100")).quantize(Decimal("0.01"))
+        estimated_total = variable_fee + sum(scheme_amounts)
+        if estimated_total > cap:
+            issues.append(
+                f"收费方案比例条款（{clause['rate']:.0f}%）按标的额估算收费约 {estimated_total:,.0f} 元"
+                f"（比例部分 {variable_fee:,.0f} 元 + 固定部分 {sum(scheme_amounts):,.0f} 元），"
+                f"已超过分段收费上限 {cap:,.0f} 元（18% 段）"
+            )
+            suggestions.append("按最高可能收费总额核对司发通〔2021〕87号分段上限，超限比例应要求下调")
 
     if not issues:
-        verdict = "pass"
+        verdict = "preliminary_pass"
         if cap is not None:
             suggestions.append(
-                f"OA 已登记的风险条款符合当前可核验规则，收费上限为 {cap:,.0f} 元"
+                f"OA 已登记的风险条款符合当前可核验规则，收费上限为 {cap:,.0f} 元；"
+                "通过后方可签署风险代理合同并履行醒目告知义务"
             )
     else:
         verdict = "issues_found"
 
     return {
-        "result": "auto_pass" if not issues else "manual_confirmation_required",
+        "result": "auto_pass" if not issues else "blocked",
         "verdict": verdict,
         "charge_method": detail.get("chargeMethodName"),
         "scheme": scheme,
         "subject_amount": float(subject_amount) if subject_amount is not None else None,
         "registered_fee": float(registered_fee) if registered_fee is not None else None,
         "scheme_amounts": [float(a) for a in scheme_amounts],
+        "percent_clauses": [
+            {"rate": float(c["rate"]), "context": c["context"]} for c in percent_clauses
+        ],
         "graduated_cap": float(cap) if cap is not None else None,
         "cap_breakdown": risk_cap_breakdown(subject_amount) if subject_amount is not None else [],
         "prohibited_matches": prohibited_hits,
         "issues": issues,
         "suggestions": suggestions,
         "notes": [
-            "系统只使用 OA 已登记的收费方案与金额；缺失、矛盾或无法核验时一律转人工",
-            "是否签署专门书面合同等材料事实不在自动审批范围内",
+            "系统只使用 OA 已登记的收费方案、金额与案件信息；合同与告知义务在审批通过后签约时履行",
+            "技术读取失败不驳回，保留待审并在下一轮重试",
         ],
         "basis": "司发通〔2021〕87号第四至七项",
     }
@@ -878,6 +1108,7 @@ def build_approval_review(
         "base_type_name": detail.get("baseTypeName"),
         "non_litigation": non_lit,
         "completeness": completeness_review(detail, entity, non_litigation=non_lit, criminal_case=criminal),
+        "system_options": system_option_review(base_url, token, detail, entity),
         "cause": cause_review(base_url, token, detail),
         "conflict": conflict_review(base_url, token, detail, lawcase_id),
         "duplicate_filing": duplicate_filing_review(base_url, token, detail, lawcase_id),
@@ -894,6 +1125,7 @@ def approval_gate_errors(
     risk_reviewed: bool = False,
 ) -> list[str]:
     errors = [f"资料不完整: {v}" for v in (review["completeness"].get("missing") or [])]
+    errors.extend(review.get("system_options", {}).get("blockers") or [])
     errors.extend(review.get("cause", {}).get("blockers") or [])
     errors.extend(review["conflict"].get("blockers") or [])
     findings = review["conflict"].get("findings") or []
@@ -902,8 +1134,60 @@ def approval_gate_errors(
     errors.extend(review.get("duplicate_filing", {}).get("blockers") or [])
     errors.extend(review.get("fee_explanation", {}).get("blockers") or [])
     risk = review["risk_charge"]
-    if risk.get("result") == "manual_confirmation_required" and not risk_reviewed:
-        errors.append("风险代理收费须合伙人审阅收费方案与初步判断后勾选确认")
+    if risk.get("result") == "blocked" and not risk_reviewed:
+        errors.extend(risk.get("issues") or ["风险代理收费资料不符合自动审批规则"])
+    return errors
+
+def approval_hard_errors(review: dict[str, Any]) -> list[str]:
+    """硬阻断：确定性违规或缺失，无人工判断也必须驳回。
+
+    仅被自动审批的决策器使用；人工审批门控继续走 approval_gate_errors，
+    因为人工审批可以靠复核确认来放过任何线索。
+    """
+    errors = [f"资料不完整: {v}" for v in (review["completeness"].get("missing") or [])]
+    errors.extend(review.get("system_options", {}).get("blockers") or [])
+    errors.extend(review.get("cause", {}).get("blockers") or [])
+    errors.extend(review["conflict"].get("blockers") or [])
+    errors.extend(review.get("duplicate_filing", {}).get("blockers") or [])
+    errors.extend(review.get("fee_explanation", {}).get("blockers") or [])
+    return errors
+
+
+def approval_manual_review_items(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """需人工复核的项目：利冲线索、重复立案线索、风险代理问题。
+
+    自动审批遇此分支不会写入 OA，留给合伙人在「审批记录」中处理。
+    """
+    items: list[dict[str, Any]] = []
+    conflict_findings = review["conflict"].get("findings") or []
+    if conflict_findings:
+        high = sum(1 for f in conflict_findings if f.get("severity") == "high")
+        items.append({
+            "kind": "conflict",
+            "summary": f"存在 {len(conflict_findings)} 条利冲检索命中（高风险 {high} 条），须合伙人复核并出具结论",
+            "findings": conflict_findings,
+        })
+    duplicate_findings = review["duplicate_filing"].get("findings") or []
+    if duplicate_findings:
+        items.append({
+            "kind": "duplicate_filing",
+            "summary": f"存在 {len(duplicate_findings)} 条当事人/案由重叠案件，须合伙人判断是否关联或重复",
+            "findings": duplicate_findings,
+        })
+    risk = review["risk_charge"]
+    if risk.get("result") == "blocked":
+        issues = risk.get("issues") or []
+        items.append({
+            "kind": "risk_charge",
+            "summary": f"风险代理收费存在 {len(issues)} 项问题，须合伙人最终决定",
+            "issues": issues,
+        })
+    return items
+
+
+def approval_technical_errors(review: dict[str, Any]) -> list[str]:
+    errors = list(review.get("completeness", {}).get("technical_errors") or [])
+    errors.extend(review.get("system_options", {}).get("technical_errors") or [])
     return errors
 
 

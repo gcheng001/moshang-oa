@@ -79,7 +79,7 @@ class SessionRegressionTests(unittest.TestCase):
 
 
 class AutomationRegressionTests(unittest.TestCase):
-    def test_rejection_fingerprint_is_scoped_to_case_and_relevant_evidence(self) -> None:
+    def test_business_rule_failure_is_rejected_with_all_reasons(self) -> None:
         review = passing_review()
         review["conflict"] = {
             "blockers": ["存在明确利冲"],
@@ -88,12 +88,83 @@ class AutomationRegressionTests(unittest.TestCase):
             "opponents": ["乙公司"],
         }
 
-        first = automation._reject_fingerprint(review, 100)
-        same = automation._reject_fingerprint(review, 100)
-        other_case = automation._reject_fingerprint(review, 101)
+        action, _, reasons = automation._decision(review)
+        self.assertEqual(action, "reject")
+        self.assertIn("存在明确利冲", reasons)
 
-        self.assertEqual(first, same)
-        self.assertNotEqual(first[0], other_case[0])
+    def test_conflict_findings_without_blockers_route_to_manual_review(self) -> None:
+        """利冲线索（无明确 block）应转人工，不自动驳回。"""
+        review = passing_review()
+        review["conflict"] = {
+            "blockers": [],
+            "findings": [{"case_id": 9, "relation": "本案对方曾作为本所委托人", "severity": "high"}],
+            "principals": ["甲公司"],
+            "opponents": ["乙公司"],
+        }
+        action, _, reasons = automation._decision(review)
+        self.assertEqual(action, "manual_review")
+        self.assertTrue(any("利冲检索命中" in r for r in reasons), f"应在 reasons 里说明利冲线索，实际={reasons}")
+
+    def test_duplicate_findings_without_blockers_route_to_manual_review(self) -> None:
+        """重复立案线索（无 block）应转人工，不自动通过。"""
+        review = passing_review()
+        review["duplicate_filing"] = {
+            "blockers": [],
+            "findings": [{"case_id": 15, "relation": "部分当事人重叠", "severity": "review"}],
+        }
+        action, _, reasons = automation._decision(review)
+        self.assertEqual(action, "manual_review")
+        self.assertTrue(any("重叠案件" in r for r in reasons), f"应在 reasons 里说明重复立案线索，实际={reasons}")
+
+    def test_risk_charge_blocked_routes_to_manual_review(self) -> None:
+        """风险代理 blocked 转人工，不自动驳回也不自动通过。"""
+        review = passing_review()
+        review["risk_charge"] = {"result": "blocked", "issues": ["已超过分段上限"]}
+        action, _, reasons = automation._decision(review)
+        self.assertEqual(action, "manual_review")
+        self.assertTrue(any("风险代理" in r for r in reasons), f"应在 reasons 里说明风险代理问题，实际={reasons}")
+
+    def test_clean_review_with_no_findings_is_approved(self) -> None:
+        """干净 review 应自动通过。"""
+        action, _, reasons = automation._decision(passing_review())
+        self.assertEqual(action, "approve")
+        self.assertEqual(reasons, ["全部适用的自动审批规则通过"])
+
+    def test_manual_review_does_not_write_to_oa(self) -> None:
+        """manual_review 走 _run_once 全流程时不调用 post_lian_approval，且清掉 first_seen。"""
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            automation, "STATE_DIR", Path(temp_dir)
+        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
+            automation, "GRACE_SECONDS", 0
+        ):
+            session = approval_session()
+            automation._write(
+                {
+                    "version": 1,
+                    "accounts": {session.username: {"enabled": True, "first_seen": {"1": {"at": "2020-01-01T00:00:00+00:00", "epoch": 0}}}},
+                }
+            )
+            manual_review = passing_review()
+            manual_review["conflict"] = {
+                "blockers": [],
+                "findings": [{"case_id": 9, "relation": "对方案件记录命中", "severity": "high"}],
+                "principals": ["甲"], "opponents": ["乙"],
+            }
+            with patch("app.automation.oa.get_case_list", return_value={"data": [{"id": 1}]}), patch(
+                "app.automation.oa.get_case_detail", return_value={"id": 1, "status": 1, "statusName": "立案待审", "preNo": "测-1"}
+            ), patch("app.automation.oa.build_approval_review", return_value=manual_review), patch(
+                "app.automation.oa.post_lian_approval"
+            ) as post, patch("app.automation.notifications.send_feishu") as feishu:
+                result = automation.run_once(session)
+
+            post.assert_not_called()
+            self.assertEqual(result["results"][0]["kind"], "manual_review")
+            self.assertEqual(result["results"][0]["action"], "manual_review")
+            # 飞书通知应被触发（转人工需要人工接管）
+            feishu.assert_called_once()
+            # first_seen 应被清掉，避免下轮重复转人工
+            state = automation._read()
+            self.assertNotIn("1", state["accounts"][session.username]["first_seen"])
 
     def test_overlapping_checks_are_rejected_instead_of_writing_twice(self) -> None:
         self.assertTrue(automation._run_lock.acquire(blocking=False))
@@ -106,14 +177,12 @@ class AutomationRegressionTests(unittest.TestCase):
     def test_disabling_during_review_stops_before_oa_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             automation, "STATE_DIR", Path(temp_dir)
-        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
-            automation, "_shadow_remaining", return_value=0
-        ):
+        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(automation, "GRACE_SECONDS", 0):
             session = approval_session()
             automation._write(
                 {
                     "version": 1,
-                    "accounts": {session.username: {"enabled": True, "shadow_started_at": "2020-01-01T00:00:00+00:00"}},
+                    "accounts": {session.username: {"enabled": True, "first_seen": {"1": {"at": "2020-01-01T00:00:00+00:00", "epoch": 0}}}},
                 }
             )
 
@@ -134,14 +203,12 @@ class AutomationRegressionTests(unittest.TestCase):
     def test_status_is_read_again_immediately_before_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             automation, "STATE_DIR", Path(temp_dir)
-        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
-            automation, "_shadow_remaining", return_value=0
-        ):
+        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(automation, "GRACE_SECONDS", 0):
             session = approval_session()
             automation._write(
                 {
                     "version": 1,
-                    "accounts": {session.username: {"enabled": True, "shadow_started_at": "2020-01-01T00:00:00+00:00"}},
+                    "accounts": {session.username: {"enabled": True, "first_seen": {"1": {"at": "2020-01-01T00:00:00+00:00", "epoch": 0}}}},
                 }
             )
             details = [
@@ -161,14 +228,12 @@ class AutomationRegressionTests(unittest.TestCase):
     def test_review_change_during_check_is_not_written(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             automation, "STATE_DIR", Path(temp_dir)
-        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
-            automation, "_shadow_remaining", return_value=0
-        ):
+        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(automation, "GRACE_SECONDS", 0):
             session = approval_session()
             automation._write(
                 {
                     "version": 1,
-                    "accounts": {session.username: {"enabled": True, "shadow_started_at": "2020-01-01T00:00:00+00:00"}},
+                    "accounts": {session.username: {"enabled": True, "first_seen": {"1": {"at": "2020-01-01T00:00:00+00:00", "epoch": 0}}}},
                 }
             )
             changed = passing_review()

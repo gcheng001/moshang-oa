@@ -70,17 +70,17 @@ if errorlevel 1 (
     goto fail
   )
 )
-"%RUNTIME%\python.exe" -m pip install --no-warn-script-location -i %PIP_MIRROR% "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "keyring>=25.0" "pystray>=0.19" "pillow>=10" "colorama" "setuptools" "pywebview"
+"%RUNTIME%\python.exe" -m pip install --no-warn-script-location -i %PIP_MIRROR% "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "keyring>=25.0" "cryptography>=43" "pystray>=0.19" "pillow>=10" "colorama" "setuptools" "pywebview"
 if errorlevel 1 (
   echo   清华镜像安装失败，改用官方 PyPI 重试 ...
-  "%RUNTIME%\python.exe" -m pip install --no-warn-script-location "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "keyring>=25.0" "pystray>=0.19" "pillow>=10" "colorama" "setuptools" "pywebview"
+  "%RUNTIME%\python.exe" -m pip install --no-warn-script-location "fastapi==0.139.0" "uvicorn==0.50.2" "requests==2.34.2" "keyring>=25.0" "cryptography>=43" "pystray>=0.19" "pillow>=10" "colorama" "setuptools" "pywebview"
   if errorlevel 1 (
     echo [失败] 依赖安装失败，请把本窗口截图发给管理员
     goto fail
   )
 )
 
-"%RUNTIME%\python.exe" -c "import fastapi, uvicorn, requests, keyring, pystray, PIL" >nul 2>&1
+"%RUNTIME%\python.exe" -c "import fastapi, uvicorn, requests, keyring, cryptography, pystray, PIL" >nul 2>&1
 if errorlevel 1 (
   echo [失败] 依赖自检未通过，请把本窗口截图发给管理员
   goto fail

@@ -479,7 +479,7 @@ export function ApprovalDetail() {
                         onChange={(e) => setRiskReviewed(e.target.checked)}
                         className="mt-0.5 h-3.5 w-3.5 accent-amber-600"
                       />
-                      我已审阅收费方案与系统初步判断，作为合伙人确认本案风险代理收费可以通过（含书面合同与告知义务已履行）
+                      我已审阅收费方案与系统初步判断，作为合伙人确认本案风险代理收费可以通过（通过后方可签署风险代理合同并履行醒目告知义务）
                     </label>
                     <input
                       value={riskMemo}

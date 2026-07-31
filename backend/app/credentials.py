@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 SERVICE_NAME = "办公助手.OA"
 LAST_ACCOUNT_KEY = "__last_account__"
+FEISHU_SERVICE_NAME = "办公助手.飞书机器人"
+FEISHU_WEBHOOK_KEY = "webhook"
 
 
 class CredentialStoreUnavailable(RuntimeError):
@@ -79,3 +81,22 @@ def forget_last_login() -> None:
     saved = load_last_login()
     if saved is not None:
         forget_password(saved.username)
+
+
+def save_feishu_webhook(webhook: str) -> None:
+    keyring, keyring_error = _keyring()
+    try:
+        if webhook.strip():
+            keyring.set_password(FEISHU_SERVICE_NAME, FEISHU_WEBHOOK_KEY, webhook.strip())
+        elif keyring.get_password(FEISHU_SERVICE_NAME, FEISHU_WEBHOOK_KEY) is not None:
+            keyring.delete_password(FEISHU_SERVICE_NAME, FEISHU_WEBHOOK_KEY)
+    except keyring_error as exc:
+        raise CredentialStoreUnavailable("无法写入飞书机器人密钥") from exc
+
+
+def load_feishu_webhook() -> str | None:
+    keyring, keyring_error = _keyring()
+    try:
+        return keyring.get_password(FEISHU_SERVICE_NAME, FEISHU_WEBHOOK_KEY)
+    except keyring_error as exc:
+        raise CredentialStoreUnavailable("无法读取飞书机器人密钥") from exc
