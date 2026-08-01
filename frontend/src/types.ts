@@ -212,6 +212,7 @@ export interface ApprovalReview {
     scheme_amounts?: number[];
     graduated_cap: number | null;
     cap_breakdown?: { range: string; rate: string; portion: number; fee: number }[];
+    prohibited_certain?: string[];
     prohibited_matches?: string[];
     issues?: string[];
     suggestions?: string[];

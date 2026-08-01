@@ -185,6 +185,92 @@ class ApprovalRuleTests(unittest.TestCase):
         risk_item = next(i for i in items if i["kind"] == "risk_charge")
         self.assertEqual(risk_item["issues"], ["缺少标的额"])
 
+    def test_prohibited_cause_labor_pay_is_certain_and_hard_blocks(self) -> None:
+        """追索劳动报酬案由+风险代理：确定命中87号文第四项，进硬阻断自动驳回。"""
+        result = oa.risk_charge_review(
+            {"baseTypeName": "民事案件", "chargeMethodName": "风险代理", "chargeAmount": 10000},
+            {"chargeMethd": {"Id": 5}, "ChargeMemo": "风险代理，固定收费1万元", "Biaodi": 100000},
+            cause_matches=[{
+                "name": "追索劳动报酬纠纷",
+                "path": "民事案由 > 劳动争议 > 劳动合同纠纷 > 追索劳动报酬纠纷",
+            }],
+        )
+        self.assertEqual(result["result"], "blocked")
+        self.assertTrue(result["prohibited_certain"])
+        self.assertIn("司发通〔2021〕87号", result["prohibited_certain"][0])
+        review = {
+            "completeness": {"missing": []}, "system_options": {"blockers": []},
+            "cause": {"blockers": []}, "conflict": {"blockers": [], "findings": []},
+            "duplicate_filing": {"blockers": [], "findings": []},
+            "fee_explanation": {"blockers": []}, "risk_charge": result,
+        }
+        self.assertTrue(any("禁止风险代理" in e for e in oa.approval_hard_errors(review)))
+        # 只有确定禁止项时不再重复产生转人工项
+        self.assertEqual(oa.approval_manual_review_items(review), [])
+
+    def test_prohibited_cause_injury_and_marriage_are_certain(self) -> None:
+        for name, path in (
+            ("工伤保险待遇纠纷", "民事案由 > 劳动争议 > 社会保险纠纷 > 工伤保险待遇纠纷"),
+            ("离婚纠纷", "民事案由 > 婚姻家庭、继承纠纷 > 婚姻家庭纠纷 > 离婚纠纷"),
+        ):
+            certain, hints = oa.risk_prohibited_certain(
+                {"baseTypeName": "民事案件"}, [{"name": name, "path": path}]
+            )
+            self.assertTrue(certain, f"{name} 应确定命中禁止范围")
+            self.assertFalse(hints)
+
+    def test_prohibited_case_type_administrative_is_certain(self) -> None:
+        """行政案件按案件类别确定禁止，无需案由命中。"""
+        certain, _ = oa.risk_prohibited_certain({"baseTypeName": "行政案件"}, [])
+        self.assertTrue(certain)
+        self.assertIn("行政案件", certain[0])
+
+    def test_labor_branch_without_pay_claim_stays_manual(self) -> None:
+        """劳动争议分支但非劳动报酬案由：不确定禁止，转人工核实诉请。"""
+        result = oa.risk_charge_review(
+            {"baseTypeName": "民事案件", "chargeMethodName": "风险代理", "chargeAmount": 10000},
+            {"chargeMethd": {"Id": 5}, "ChargeMemo": "风险代理，固定收费1万元", "Biaodi": 100000},
+            cause_matches=[{
+                "name": "确认劳动关系纠纷",
+                "path": "民事案由 > 劳动争议 > 劳动合同纠纷 > 确认劳动关系纠纷",
+            }],
+        )
+        self.assertEqual(result["prohibited_certain"], [])
+        self.assertTrue(any("须合伙人核实诉讼请求" in i for i in result["issues"]))
+        review = {
+            "completeness": {"missing": []}, "system_options": {"blockers": []},
+            "cause": {"blockers": []}, "conflict": {"blockers": [], "findings": []},
+            "duplicate_filing": {"blockers": [], "findings": []},
+            "fee_explanation": {"blockers": []}, "risk_charge": result,
+        }
+        self.assertEqual(oa.approval_hard_errors(review), [])
+        self.assertEqual({i["kind"] for i in oa.approval_manual_review_items(review)}, {"risk_charge"})
+
+    def test_prohibited_certain_not_waivable_by_risk_reviewed(self) -> None:
+        """人工审批勾选「已复核风险收费」也不能放行确定禁止案件。"""
+        review = {
+            "completeness": {"missing": []}, "system_options": {"blockers": []},
+            "cause": {"blockers": []}, "conflict": {"blockers": [], "findings": []},
+            "duplicate_filing": {"blockers": [], "findings": []},
+            "fee_explanation": {"blockers": []},
+            "risk_charge": {
+                "result": "blocked",
+                "prohibited_certain": ["案由「追索劳动报酬纠纷」属于禁止风险代理的案件范围"],
+                "issues": ["案由「追索劳动报酬纠纷」属于禁止风险代理的案件范围"],
+            },
+        }
+        gate = oa.approval_gate_errors(review, risk_reviewed=True)
+        self.assertTrue(any("禁止风险代理" in e for e in gate))
+
+    def test_non_risk_charge_ignores_prohibited_cause(self) -> None:
+        """非风险代理收费的劳动报酬案件不适用本审查。"""
+        result = oa.risk_charge_review(
+            {"baseTypeName": "民事案件", "chargeMethodName": "计件收费", "chargeAmount": 5000},
+            {"chargeMethd": {"Id": 1}},
+            cause_matches=[{"name": "追索劳动报酬纠纷", "path": "民事案由 > 劳动争议"}],
+        )
+        self.assertEqual(result["result"], "not_applicable")
+
     def test_manual_review_items_empty_for_clean_review(self) -> None:
         """无线索的干净 review 不应进入转人工列表。"""
         review = {

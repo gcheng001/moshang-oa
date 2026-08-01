@@ -41,9 +41,32 @@ RISK_PROHIBITED_KEYWORDS = (
     "扶养费",
     "抚恤金",
     "救济金",
-    "工伤赔偿",
+    "工伤",
     "劳动报酬",
+    "工资",
+    "加班费",
+    "欠薪",
 )
+# 司发通〔2021〕87号第（四）项的确定命中层：案件基础类别或规范案由（含字典
+# 层级路径）落入禁止范围即为确定违规，风险代理案件据此直接驳回，不再转人工。
+RISK_PROHIBITED_CASE_TYPES = {"刑事案件", "行政案件", "赔偿案件"}
+RISK_PROHIBITED_CAUSE_MARKERS = (
+    "婚姻",
+    "离婚",
+    "继承",
+    "社会保险",
+    "追索劳动报酬",
+    "劳动报酬",
+    "工伤",
+    "赡养",
+    "抚养",
+    "扶养",
+    "最低生活保障",
+    "抚恤金",
+    "救济金",
+)
+# 案由属于劳动争议分支但未确定命中劳动报酬时，可能混有劳动报酬请求，转人工核实
+RISK_LABOR_HINT_MARKERS = ("劳动争议", "劳动合同", "人事争议")
 RISK_FEE_TIERS = (
     (Decimal("1000000"), Decimal("0.18")),
     (Decimal("4000000"), Decimal("0.15")),
@@ -985,16 +1008,55 @@ def risk_cap_breakdown(subject_amount: Decimal) -> list[dict[str, Any]]:
     return lines
 
 
-def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_amount: Any = None) -> dict[str, Any]:
+def risk_prohibited_certain(
+    detail: dict[str, Any], cause_matches: list[dict[str, Any]] | None
+) -> tuple[list[str], list[str]]:
+    """87号文第（四）项确定命中与劳动争议人工核实线索。
+
+    确定命中只依据结构化字段：案件基础类别（刑事/行政/国家赔偿），或已命中
+    OA 案由字典的规范案由及其层级路径落入禁止范围。自由文本不产生确定命中。
+    """
+    certain: list[str] = []
+    hints: list[str] = []
+    case_type = normalized_case_type(detail)
+    if case_type in RISK_PROHIBITED_CASE_TYPES:
+        certain.append(
+            f"{case_type}禁止实行或者变相实行风险代理（司发通〔2021〕87号第四项），应驳回或改用其他收费方式"
+        )
+    for match in cause_matches or []:
+        name = str(match.get("name") or "")
+        text = f"{name} {match.get('path') or ''}"
+        marker = next((m for m in RISK_PROHIBITED_CAUSE_MARKERS if m in text), None)
+        if marker:
+            certain.append(
+                f"案由「{name}」属于禁止风险代理的案件范围（命中「{marker}」类，"
+                "司发通〔2021〕87号第四项），应驳回或改用其他收费方式"
+            )
+        elif any(m in text for m in RISK_LABOR_HINT_MARKERS):
+            hints.append(
+                f"案由「{name}」属于劳动争议类，若诉请包含劳动报酬即禁止风险代理，须合伙人核实诉讼请求"
+            )
+    return certain, hints
+
+
+def risk_charge_review(
+    detail: dict[str, Any],
+    entity: dict[str, Any],
+    risk_fee_amount: Any = None,
+    cause_matches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """风险代理审查只核验 OA 中可机器读取的风险条款与收费数据。
 
     规则完整、未命中禁止范围且金额未超限时可以自动通过；任何资料外
     判断（例如合同是否实际签署）都不会由自动审批代替人工判断。
     审批在先、签约在后：审批阶段不要求已登记合同或告知材料。
+    禁止范围分两层：案件类别/规范案由确定命中为硬阻断（自动驳回）；
+    自由文本关键词命中只作线索转人工。
     """
     if not is_risk_charge(detail, entity):
         return {"result": "not_applicable", "charge_method": detail.get("chargeMethodName")}
 
+    prohibited_certain, labor_hints = risk_prohibited_certain(detail, cause_matches)
     description = " ".join(
         str(value or "")
         for value in (
@@ -1006,20 +1068,22 @@ def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_
         )
     )
     prohibited_hits = [kw for kw in RISK_PROHIBITED_KEYWORDS if kw in description]
-    base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
-    if "行政" in base_type and "行政诉讼" not in prohibited_hits:
-        prohibited_hits.append("行政诉讼")
 
     scheme = str(entity.get("ChargeMemo") or "").strip() or None
     subject_amount = decimal_value(entity.get("Biaodi") or detail.get("biaodi"))
     registered_fee = decimal_value(detail.get("chargeAmount"))
     cap = risk_fee_cap(subject_amount)
 
-    issues: list[str] = []
+    issues: list[str] = list(prohibited_certain)
+    issues.extend(labor_hints)
     suggestions: list[str] = []
-    if prohibited_hits:
-        issues.append("案件描述命中风险代理禁止适用情形: " + "、".join(prohibited_hits))
-        suggestions.append("若确属禁止范围，应驳回并改用计件/计时等收费方式")
+    if prohibited_certain:
+        suggestions.append("禁止风险代理案件不能通过审批，应驳回；如需承办请改用计件/计时等收费方式重新提交")
+    # 确定命中已经陈述的情形不再用自由文本线索重复表达
+    remaining_hits = [kw for kw in prohibited_hits if not any(kw in c for c in prohibited_certain)]
+    if remaining_hits:
+        issues.append("案件描述命中风险代理禁止适用情形线索: " + "、".join(remaining_hits))
+        suggestions.append("若经核实确属禁止范围，应驳回并改用计件/计时等收费方式")
     if not scheme:
         issues.append("OA 未填写收费方案（收费说明），无法审查具体收费结构")
         suggestions.append("要求经办律师在 OA 补充完整收费方案后重新审查")
@@ -1079,6 +1143,7 @@ def risk_charge_review(detail: dict[str, Any], entity: dict[str, Any], risk_fee_
         ],
         "graduated_cap": float(cap) if cap is not None else None,
         "cap_breakdown": risk_cap_breakdown(subject_amount) if subject_amount is not None else [],
+        "prohibited_certain": prohibited_certain,
         "prohibited_matches": prohibited_hits,
         "issues": issues,
         "suggestions": suggestions,
@@ -1100,6 +1165,7 @@ def build_approval_review(
     entity = get_case_entity(base_url, token, lawcase_id, detail)
     non_lit = is_non_litigation(detail)
     criminal = is_criminal_case(detail)
+    cause = cause_review(base_url, token, detail)
     return {
         "lawcase_id": lawcase_id,
         "case_no": detail.get("no") or detail.get("preNo"),
@@ -1109,11 +1175,13 @@ def build_approval_review(
         "non_litigation": non_lit,
         "completeness": completeness_review(detail, entity, non_litigation=non_lit, criminal_case=criminal),
         "system_options": system_option_review(base_url, token, detail, entity),
-        "cause": cause_review(base_url, token, detail),
+        "cause": cause,
         "conflict": conflict_review(base_url, token, detail, lawcase_id),
         "duplicate_filing": duplicate_filing_review(base_url, token, detail, lawcase_id),
         "fee_explanation": fee_explanation_review(detail, entity, non_litigation=non_lit),
-        "risk_charge": risk_charge_review(detail, entity, risk_fee_amount),
+        "risk_charge": risk_charge_review(
+            detail, entity, risk_fee_amount, cause_matches=cause.get("matches")
+        ),
     }
 
 
@@ -1134,15 +1202,20 @@ def approval_gate_errors(
     errors.extend(review.get("duplicate_filing", {}).get("blockers") or [])
     errors.extend(review.get("fee_explanation", {}).get("blockers") or [])
     risk = review["risk_charge"]
+    certain = risk.get("prohibited_certain") or []
+    # 禁止风险代理案件是确定违规，勾选「已复核」也不能放行
+    errors.extend(certain)
     if risk.get("result") == "blocked" and not risk_reviewed:
-        errors.extend(risk.get("issues") or ["风险代理收费资料不符合自动审批规则"])
+        rest = [i for i in (risk.get("issues") or []) if i not in certain]
+        errors.extend(rest or ([] if certain else ["风险代理收费资料不符合自动审批规则"]))
     return errors
 
 def approval_hard_errors(review: dict[str, Any]) -> list[str]:
     """硬阻断：确定性违规或缺失，无人工判断也必须驳回。
 
     仅被自动审批的决策器使用；人工审批门控继续走 approval_gate_errors，
-    因为人工审批可以靠复核确认来放过任何线索。
+    因为人工审批可以靠复核确认来放过任何线索。风险代理仅「禁止案件
+    确定命中」进入硬阻断，其余风险收费问题仍转人工。
     """
     errors = [f"资料不完整: {v}" for v in (review["completeness"].get("missing") or [])]
     errors.extend(review.get("system_options", {}).get("blockers") or [])
@@ -1150,6 +1223,7 @@ def approval_hard_errors(review: dict[str, Any]) -> list[str]:
     errors.extend(review["conflict"].get("blockers") or [])
     errors.extend(review.get("duplicate_filing", {}).get("blockers") or [])
     errors.extend(review.get("fee_explanation", {}).get("blockers") or [])
+    errors.extend(review.get("risk_charge", {}).get("prohibited_certain") or [])
     return errors
 
 
@@ -1176,12 +1250,15 @@ def approval_manual_review_items(review: dict[str, Any]) -> list[dict[str, Any]]
         })
     risk = review["risk_charge"]
     if risk.get("result") == "blocked":
-        issues = risk.get("issues") or []
-        items.append({
-            "kind": "risk_charge",
-            "summary": f"风险代理收费存在 {len(issues)} 项问题，须合伙人最终决定",
-            "issues": issues,
-        })
+        certain = risk.get("prohibited_certain") or []
+        # 确定禁止项走硬阻断自动驳回，这里只汇总仍需人工裁量的问题
+        issues = [i for i in (risk.get("issues") or []) if i not in certain]
+        if issues:
+            items.append({
+                "kind": "risk_charge",
+                "summary": f"风险代理收费存在 {len(issues)} 项问题，须合伙人最终决定",
+                "issues": issues,
+            })
     return items
 
 

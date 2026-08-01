@@ -64,6 +64,8 @@ export function ApprovalDetail() {
         ...review.conflict.blockers,
         ...review.duplicate_filing.blockers,
         ...(review.fee_explanation?.blockers ?? []),
+        // 禁止风险代理案件确定命中：勾选复核也不能放行，与后端 gate_errors 一致
+        ...(review.risk_charge.prohibited_certain ?? []),
       ]
     : [];
 
