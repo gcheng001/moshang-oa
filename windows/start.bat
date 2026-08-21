@@ -5,6 +5,17 @@ setlocal
 title 办公助手
 cd /d "%~dp0"
 
+rem Auto-update: pull latest code from GitHub before starting (repo layout only)
+if exist "%~dp0..\.git" (
+  echo 正在检查更新...
+  cd /d "%~dp0.."
+  git pull --ff-only origin main >nul 2>&1
+  if errorlevel 1 (
+    echo [提示] 自动更新失败（可能无网络或本地有改动），使用当前版本启动
+  )
+  cd /d "%~dp0"
+)
+
 if exist "%~dp0runtime\python.exe" (
   set "PYEXE=%~dp0runtime\python.exe"
   set "SCRIPT=%~dp0serve_win.py"
