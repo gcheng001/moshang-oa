@@ -426,7 +426,8 @@ def _run_once(session: sessions.Session) -> dict[str, Any]:
 
 
 def _background() -> None:
-    while not _stop.wait(POLL_SECONDS):
+    backoff = 0
+    while not _stop.wait(POLL_SECONDS * (2 ** min(backoff, 5))):
         try:
             saved = credentials.load_last_login()
         except credentials.CredentialStoreUnavailable:
@@ -442,7 +443,9 @@ def _background() -> None:
             state = status(session.username)
             if session.can_approve and state["enabled"] and not state["paused"]:
                 run_once(session)
+            backoff = 0
         except Exception as exc:
+            backoff += 1
             with _lock:
                 state_data = _read()
                 account = _account(state_data, saved.username)

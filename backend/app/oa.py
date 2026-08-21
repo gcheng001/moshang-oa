@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import threading
 import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -86,6 +87,29 @@ class OAError(RuntimeError):
 # APP 可能从带 https_proxy 环境变量的 shell 被拉起——OA 请求一律直连，忽略代理环境。
 _http = requests.Session()
 _http.trust_env = False
+
+_party_cache_lock = threading.Lock()
+_party_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+PARTY_CACHE_TTL_SECONDS = 5 * 60
+_entity_owner_lock = threading.Lock()
+_entity_owner_cache: dict[str, str] = {}
+
+
+def _party_search_cached(base_url: str, token: str, keyword: str) -> list[dict[str, Any]]:
+    key = f"{base_url}|{keyword}"
+    with _party_cache_lock:
+        cached = _party_cache.get(key)
+        if cached and time.time() - cached[0] < PARTY_CACHE_TTL_SECONDS:
+            return cached[1]
+    rows = get_case_list_all(base_url, token, keyword)
+    with _party_cache_lock:
+        _party_cache[key] = (time.time(), rows)
+    return rows
+
+
+def clear_party_cache() -> None:
+    with _party_cache_lock:
+        _party_cache.clear()
 
 
 def login(base_url: str, api_key: str) -> str:
@@ -351,21 +375,26 @@ def get_case_detail(base_url: str, token: str, lawcase_id: int) -> dict[str, Any
 
 def get_case_entity(base_url: str, token: str, lawcase_id: int, detail: dict[str, Any]) -> dict[str, Any]:
     base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+    with _entity_owner_lock:
+        known_owner = _entity_owner_cache.get(f"{base_url}|{base_type}")
     preferred: list[str] = []
-    if "刑事" in base_type:
-        preferred.append("Page:LawcaseDetails_刑事@1")
-    elif "行政" in base_type:
-        preferred.append("Page:LawcaseDetails_行政@1")
-    elif any(keyword in base_type for keyword in ("非诉", "顾问", "咨询", "代书", "公益")):
-        preferred.extend(
-            ["Page:LawcaseDetails_非诉@1", "Page:LawcaseDetails_法律顾问@1", "Page:LawcaseDetails_顾问@1"]
-        )
-    elif "仲裁" in base_type:
-        preferred.append("Page:LawcaseDetails_仲裁@1")
-    elif "执行" in base_type:
-        preferred.append("Page:LawcaseDetails_执行@1")
+    if known_owner:
+        preferred.append(known_owner)
     else:
-        preferred.append("Page:LawcaseDetails_民事@1")
+        if "刑事" in base_type:
+            preferred.append("Page:LawcaseDetails_刑事@1")
+        elif "行政" in base_type:
+            preferred.append("Page:LawcaseDetails_行政@1")
+        elif any(keyword in base_type for keyword in ("非诉", "顾问", "咨询", "代书", "公益")):
+            preferred.extend(
+                ["Page:LawcaseDetails_非诉@1", "Page:LawcaseDetails_法律顾问@1", "Page:LawcaseDetails_顾问@1"]
+            )
+        elif "仲裁" in base_type:
+            preferred.append("Page:LawcaseDetails_仲裁@1")
+        elif "执行" in base_type:
+            preferred.append("Page:LawcaseDetails_执行@1")
+        else:
+            preferred.append("Page:LawcaseDetails_民事@1")
     owners = preferred + [
         "Page:LawcaseDetails_民事@1", "Page:LawcaseDetails_刑事@1", "Page:LawcaseDetails_行政@1",
         "Page:LawcaseDetails_非诉@1", "Page:LawcaseDetails_法律顾问@1", "Page:LawcaseDetails_顾问@1",
@@ -393,6 +422,8 @@ def get_case_entity(base_url: str, token: str, lawcase_id: int, detail: dict[str
             continue
         value = result.get("Value") if isinstance(result, dict) else None
         if isinstance(value, dict) and value:
+            with _entity_owner_lock:
+                _entity_owner_cache[f"{base_url}|{base_type}"] = owner
             return value
     if last_error is not None:
         raise OAError(f"无法读取案件登记原始字段，稍后自动重试：{last_error}")
@@ -914,7 +945,7 @@ def conflict_review(base_url: str, token: str, detail: dict[str, Any], lawcase_i
 
     searched: dict[str, list[dict[str, Any]]] = {}
     for name in dict.fromkeys(principals + opponents):
-        searched[name] = get_case_list_all(base_url, token, name)
+        searched[name] = _party_search_cached(base_url, token, name)
 
     seen = set()
     for searched_name, rows in searched.items():
@@ -974,7 +1005,7 @@ def duplicate_filing_review(base_url: str, token: str, detail: dict[str, Any], l
 
     searched: dict[str, list[dict[str, Any]]] = {}
     for name in dict.fromkeys(principals + opponents):
-        searched[name] = get_case_list_all(base_url, token, name)
+        searched[name] = _party_search_cached(base_url, token, name)
 
     candidates: dict[int, dict[str, Any]] = {}
     for rows in searched.values():

@@ -7,6 +7,9 @@ from app import oa
 
 
 class ApprovalRuleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        oa.clear_party_cache()
+
     def test_all_eleven_case_types_are_recognized(self) -> None:
         raw = [
             "民事案件", "刑事案件", "行政案件", "执行案件", "法律顾问签约",
