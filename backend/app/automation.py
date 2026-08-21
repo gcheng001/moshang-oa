@@ -22,7 +22,7 @@ from . import credentials, notifications, oa, sessions
 POLL_SECONDS = 3 * 60
 GRACE_SECONDS = 2 * 60
 TECHNICAL_ALERT_THRESHOLD = 3
-RULE_VERSION = "2026.07.29-v2"
+RULE_VERSION = "2026.08.20-v1"
 STATE_DIR = Path.home() / ".office-assistant"
 STATE_FILE = STATE_DIR / "approval-automation.json"
 
@@ -71,6 +71,7 @@ def _account(state: dict[str, Any], username: str) -> dict[str, Any]:
     value.setdefault("last_error", None)
     value.setdefault("events", [])
     value.setdefault("first_seen", {})
+    value.setdefault("manual_pending", {})
     value.setdefault("consecutive_failures", 0)
     value.setdefault("technical_alert_open", False)
     return value
@@ -84,6 +85,11 @@ def _events(account: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
 def _record(account: dict[str, Any], event: dict[str, Any]) -> None:
     account.setdefault("events", []).append({"at": _now(), **event})
     del account["events"][:-500]
+
+
+def _manual_reason_fingerprint(reasons: list[str]) -> str:
+    normalized = sorted({str(reason).strip() for reason in reasons if str(reason).strip()})
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
 
 
 def _device() -> dict[str, str]:
@@ -206,6 +212,15 @@ def _notify_safely(message: str) -> None:
         pass
 
 
+def _clear_case_tracking(username: str, case_key: str) -> None:
+    with _lock:
+        state = _read()
+        account = _account(state, username)
+        account.setdefault("first_seen", {}).pop(case_key, None)
+        account.setdefault("manual_pending", {}).pop(case_key, None)
+        _write(state)
+
+
 def run_once(session: sessions.Session) -> dict[str, Any]:
     if not _run_lock.acquire(blocking=False):
         raise ValueError("自动审批检查正在进行，请稍后再试")
@@ -243,6 +258,9 @@ def _run_once(session: sessions.Session) -> dict[str, Any]:
         first_seen = account.setdefault("first_seen", {})
         for stale in set(first_seen) - pending_ids:
             first_seen.pop(stale, None)
+        manual_pending = account.setdefault("manual_pending", {})
+        for stale in set(manual_pending) - pending_ids:
+            manual_pending.pop(stale, None)
         _write(state)
 
     results: list[dict[str, Any]] = []
@@ -283,6 +301,7 @@ def _run_once(session: sessions.Session) -> dict[str, Any]:
             detail = oa.get_case_detail(session.base_url, session.token, lawcase_id)
             if oa.row_status(detail) != 1:
                 event.update(kind="status_changed", message="案件已不再是立案待审，本次未写入 OA")
+                _clear_case_tracking(session.username, case_key)
                 results.append(event)
                 record_event(session.username, event)
                 continue
@@ -317,6 +336,7 @@ def _run_once(session: sessions.Session) -> dict[str, Any]:
             fresh = oa.get_case_detail(session.base_url, session.token, lawcase_id)
             if oa.row_status(fresh) != 1:
                 event.update(kind="status_changed", message="写入前状态已变化，本次未写入 OA")
+                _clear_case_tracking(session.username, case_key)
                 record_event(session.username, event)
                 results.append(event)
                 continue
@@ -328,7 +348,7 @@ def _run_once(session: sessions.Session) -> dict[str, Any]:
                 results.append(event)
                 continue
             if action == "manual_review":
-                # 转人工：本次不写 OA，只落记录并清掉首次复读标记，避免下轮重复转人工
+                fingerprint = _manual_reason_fingerprint(reasons)
                 completed_at = _now()
                 event.update(
                     kind="manual_review",
@@ -342,10 +362,20 @@ def _run_once(session: sessions.Session) -> dict[str, Any]:
                 )
                 with _lock:
                     state = _read()
-                    _account(state, session.username).setdefault("first_seen", {}).pop(case_key, None)
+                    account = _account(state, session.username)
+                    manual_pending = account.setdefault("manual_pending", {})
+                    previous = manual_pending.get(case_key) or {}
+                    if previous.get("fingerprint") == fingerprint:
+                        _write(state)
+                        continue
+                    manual_pending[case_key] = {
+                        "fingerprint": fingerprint,
+                        "reasons": reasons,
+                        "updated_at": completed_at,
+                    }
+                    _record(account, event)
                     _write(state)
                 _notify_safely(f"办公助手转人工：{event['case_no']}\n" + "\n".join(reasons))
-                record_event(session.username, event)
                 results.append(event)
                 continue
             numbered = "；".join(f"{index + 1}. {reason}" for index, reason in enumerate(reasons))
@@ -370,10 +400,7 @@ def _run_once(session: sessions.Session) -> dict[str, Any]:
                 new_status=after.get("status"),
                 new_status_name=after.get("statusName"),
             )
-            with _lock:
-                state = _read()
-                _account(state, session.username).setdefault("first_seen", {}).pop(case_key, None)
-                _write(state)
+            _clear_case_tracking(session.username, case_key)
             _notify_safely(f"办公助手自动{'通过' if action == 'approve' else '驳回'}：{event['case_no']}\n{numbered}")
         record_event(session.username, event)
         results.append(event)

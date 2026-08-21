@@ -25,6 +25,8 @@ export function ApprovalDetail() {
   const [conflictMemo, setConflictMemo] = useState("");
   const [riskReviewed, setRiskReviewed] = useState(false);
   const [riskMemo, setRiskMemo] = useState("");
+  const [duplicateReviewed, setDuplicateReviewed] = useState(false);
+  const [duplicateMemo, setDuplicateMemo] = useState("");
 
   const [dialog, setDialog] = useState<"approve" | "reject" | null>(null);
   const [memo, setMemo] = useState("");
@@ -40,6 +42,8 @@ export function ApprovalDetail() {
     setConflictMemo("");
     setRiskReviewed(false);
     setRiskMemo("");
+    setDuplicateReviewed(false);
+    setDuplicateMemo("");
     try {
       setReview(await api.approvalCheck(lawcaseId));
     } catch (err) {
@@ -55,6 +59,7 @@ export function ApprovalDetail() {
 
   const conflictFindings = review?.conflict.findings ?? [];
   const duplicateFindings = review?.duplicate_filing.findings ?? [];
+  const duplicateInformational = review?.duplicate_filing.informational ?? [];
   const isRisk = review ? review.risk_charge.result !== "not_applicable" : false;
 
   const hardBlockers = review
@@ -62,7 +67,6 @@ export function ApprovalDetail() {
         ...review.completeness.missing.map((m) => `资料不完整: ${m}`),
         ...(review.cause?.blockers ?? []),
         ...review.conflict.blockers,
-        ...review.duplicate_filing.blockers,
         ...(review.fee_explanation?.blockers ?? []),
         // 禁止风险代理案件确定命中：勾选复核也不能放行，与后端 gate_errors 一致
         ...(review.risk_charge.prohibited_certain ?? []),
@@ -76,6 +80,12 @@ export function ApprovalDetail() {
   if (review && conflictFindings.length > 0 && !(conflictReviewed && conflictMemo.trim() !== ""))
     pendingConfirms.push("利冲线索人工复核（勾选并填写结论）");
   if (review && isRisk && !riskReviewed) pendingConfirms.push("风险代理收费方案审阅确认（勾选）");
+  if (
+    review &&
+    (duplicateFindings.length > 0 || review.duplicate_filing.blockers.length > 0) &&
+    !(duplicateReviewed && duplicateMemo.trim() !== "")
+  )
+    pendingConfirms.push("重复立案/另案收费人工复核（勾选并填写结论）");
 
   const approveReady = !notPending && hardBlockers.length === 0 && pendingConfirms.length === 0;
 
@@ -116,13 +126,15 @@ export function ApprovalDetail() {
     try {
       const result =
         action === "approve"
-          ? await api.approve(lawcaseId, {
-              memo,
-              conflict_reviewed: conflictReviewed,
-              conflict_memo: conflictMemo,
-              risk_reviewed: riskReviewed,
-              risk_memo: riskMemo,
-            })
+         ? await api.approve(lawcaseId, {
+             memo,
+             conflict_reviewed: conflictReviewed,
+             conflict_memo: conflictMemo,
+             risk_reviewed: riskReviewed,
+             risk_memo: riskMemo,
+              duplicate_reviewed: duplicateReviewed,
+              duplicate_memo: duplicateMemo,
+           })
           : await api.reject(lawcaseId, memo);
       setDialog(null);
       setDone(
@@ -337,8 +349,12 @@ export function ApprovalDetail() {
 
             <CheckCard
               title="重复立案检查"
-              ok={review.duplicate_filing.result === "no_duplicate_filing_match"}
-              okText="未发现 OA 内重复立案"
+              ok={review.duplicate_filing.blockers.length === 0 && duplicateFindings.length === 0}
+              okText={
+                duplicateInformational.length > 0
+                  ? `已识别 ${duplicateInformational.length} 条不同审级/程序阶段关联案，不按重复立案处理`
+                  : "未发现 OA 内重复立案"
+              }
               problems={review.duplicate_filing.blockers}
               warning={
                 duplicateFindings.length > 0 && review.duplicate_filing.blockers.length === 0
@@ -361,6 +377,41 @@ export function ApprovalDetail() {
                     emp: f.emp_names,
                   }))}
                 />
+              )}
+              {duplicateInformational.length > 0 && (
+                <FindingList
+                  rows={duplicateInformational.map((f) => ({
+                    key: `info-${f.case_id}`,
+                    no: f.case_no || String(f.case_id),
+                    matched: [...f.principal_overlap, ...f.opponent_overlap].join("、"),
+                    relation: f.relation,
+                    statusName: f.status_name || "",
+                    severity: "info",
+                    wtr: f.wtr_names,
+                    tos: f.tos_names,
+                    cause: f.cause,
+                    emp: f.emp_names,
+                  }))}
+                />
+              )}
+              {(duplicateFindings.length > 0 || review.duplicate_filing.blockers.length > 0) && (
+                <div className="mt-3 space-y-2 rounded-lg bg-amber-50 p-3">
+                  <label className="flex items-start gap-2 text-xs font-medium text-amber-800">
+                    <input
+                      type="checkbox"
+                      checked={duplicateReviewed}
+                      onChange={(e) => setDuplicateReviewed(e.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5 accent-amber-600"
+                    />
+                    我已人工复核上述重叠/疑似重复立案线索，确认属于另案收费、关联案件或其他合理情形，可以立案
+                  </label>
+                  <input
+                    value={duplicateMemo}
+                    onChange={(e) => setDuplicateMemo(e.target.value)}
+                    placeholder="复核结论（必填，将写入审批意见，如：另案已收费、关联案件非重复立案等）"
+                    className="w-full rounded-md border border-amber-200 bg-white px-2.5 py-1.5 text-xs outline-none focus:border-amber-400"
+                  />
+                </div>
               )}
             </CheckCard>
 
@@ -713,6 +764,7 @@ const SEVERITY_LABELS: Record<string, { text: string; className: string }> = {
   high: { text: "对方案件在办 · 高风险", className: "bg-red-50 text-red-600" },
   block: { text: "疑似重复 · 阻断", className: "bg-red-50 text-red-600" },
   review: { text: "需人工复核", className: "bg-amber-50 text-amber-700" },
+  info: { text: "不同审级/程序 · 非重复", className: "bg-emerald-50 text-emerald-700" },
 };
 
 function FindingList({

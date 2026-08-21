@@ -131,7 +131,7 @@ class AutomationRegressionTests(unittest.TestCase):
         self.assertEqual(reasons, ["全部适用的自动审批规则通过"])
 
     def test_manual_review_does_not_write_to_oa(self) -> None:
-        """manual_review 走 _run_once 全流程时不调用 post_lian_approval，且清掉 first_seen。"""
+        """manual_review 不写 OA，并保留状态以便下轮直接复核。"""
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             automation, "STATE_DIR", Path(temp_dir)
         ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
@@ -162,9 +162,146 @@ class AutomationRegressionTests(unittest.TestCase):
             self.assertEqual(result["results"][0]["action"], "manual_review")
             # 飞书通知应被触发（转人工需要人工接管）
             feishu.assert_called_once()
-            # first_seen 应被清掉，避免下轮重复转人工
             state = automation._read()
-            self.assertNotIn("1", state["accounts"][session.username]["first_seen"])
+            account = state["accounts"][session.username]
+            self.assertIn("1", account["first_seen"])
+            self.assertIn("1", account["manual_pending"])
+
+    def test_same_manual_review_is_recorded_and_notified_only_once_across_polls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            automation, "STATE_DIR", Path(temp_dir)
+        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
+            automation, "GRACE_SECONDS", 0
+        ):
+            session = approval_session()
+            automation._write(
+                {
+                    "version": 1,
+                    "accounts": {
+                        session.username: {
+                            "enabled": True,
+                            "first_seen": {"1": {"at": "2020-01-01T00:00:00+00:00", "epoch": 0}},
+                        }
+                    },
+                }
+            )
+            manual_review = passing_review()
+            manual_review["conflict"] = {
+                "blockers": [],
+                "findings": [{"case_id": 9, "relation": "对方案件记录命中", "severity": "high"}],
+                "principals": ["甲"],
+                "opponents": ["乙"],
+            }
+            with patch(
+                "app.automation.oa.get_case_list", return_value={"data": [{"id": 1}]}
+            ), patch(
+                "app.automation.oa.get_case_detail",
+                return_value={"id": 1, "status": 1, "statusName": "立案待审", "preNo": "测-1"},
+            ), patch(
+                "app.automation.oa.build_approval_review", return_value=manual_review
+            ) as build_review, patch(
+                "app.automation.oa.post_lian_approval"
+            ) as post, patch(
+                "app.automation.notifications.send_feishu"
+            ) as feishu:
+                first = automation.run_once(session)
+                second = automation.run_once(session)
+
+            post.assert_not_called()
+            self.assertEqual([item["kind"] for item in first["results"]], ["manual_review"])
+            self.assertEqual(second["results"], [])
+            self.assertEqual(build_review.call_count, 4, "第二轮必须继续执行两次复核")
+            feishu.assert_called_once()
+            kinds = [event["kind"] for event in automation.history(session.username)]
+            self.assertEqual(kinds.count("manual_review"), 1)
+            self.assertEqual(kinds.count("waiting_reread"), 0)
+
+    def test_changed_manual_review_reasons_are_recorded_and_notified_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            automation, "STATE_DIR", Path(temp_dir)
+        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
+            automation, "GRACE_SECONDS", 0
+        ):
+            session = approval_session()
+            automation._write(
+                {
+                    "version": 1,
+                    "accounts": {
+                        session.username: {
+                            "enabled": True,
+                            "first_seen": {"1": {"at": "2020-01-01T00:00:00+00:00", "epoch": 0}},
+                        }
+                    },
+                }
+            )
+            first_review = passing_review()
+            first_review["conflict"] = {
+                "blockers": [],
+                "findings": [{"case_id": 9, "relation": "对方案件记录命中", "severity": "high"}],
+                "principals": ["甲"],
+                "opponents": ["乙"],
+            }
+            changed_review = passing_review()
+            changed_review["duplicate_filing"] = {
+                "blockers": [],
+                "findings": [{"case_id": 10, "relation": "部分当事人重叠", "severity": "review"}],
+            }
+            with patch(
+                "app.automation.oa.get_case_list", return_value={"data": [{"id": 1}]}
+            ), patch(
+                "app.automation.oa.get_case_detail",
+                return_value={"id": 1, "status": 1, "statusName": "立案待审", "preNo": "测-1"},
+            ), patch(
+                "app.automation.oa.build_approval_review",
+                side_effect=[first_review, first_review, changed_review, changed_review],
+            ), patch(
+                "app.automation.oa.post_lian_approval"
+            ) as post, patch(
+                "app.automation.notifications.send_feishu"
+            ) as feishu:
+                first = automation.run_once(session)
+                second = automation.run_once(session)
+
+            post.assert_not_called()
+            self.assertEqual([item["kind"] for item in first["results"]], ["manual_review"])
+            self.assertEqual([item["kind"] for item in second["results"]], ["manual_review"])
+            self.assertEqual(feishu.call_count, 2)
+            kinds = [event["kind"] for event in automation.history(session.username)]
+            self.assertEqual(kinds.count("manual_review"), 2)
+            self.assertEqual(kinds.count("waiting_reread"), 0)
+
+    def test_non_pending_detail_clears_manual_review_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            automation, "STATE_DIR", Path(temp_dir)
+        ), patch.object(automation, "STATE_FILE", Path(temp_dir) / "state.json"), patch.object(
+            automation, "GRACE_SECONDS", 0
+        ):
+            session = approval_session()
+            automation._write(
+                {
+                    "version": 1,
+                    "accounts": {
+                        session.username: {
+                            "enabled": True,
+                            "first_seen": {"1": {"at": "2020-01-01T00:00:00+00:00", "epoch": 0}},
+                            "manual_pending": {"1": {"fingerprint": "old"}},
+                        }
+                    },
+                }
+            )
+            with patch(
+                "app.automation.oa.get_case_list", return_value={"data": [{"id": 1}]}
+            ), patch(
+                "app.automation.oa.get_case_detail",
+                return_value={"id": 1, "status": 3, "statusName": "已立案", "preNo": "测-1"},
+            ), patch("app.automation.oa.post_lian_approval") as post:
+                result = automation.run_once(session)
+
+            post.assert_not_called()
+            self.assertEqual([item["kind"] for item in result["results"]], ["status_changed"])
+            account = automation._read()["accounts"][session.username]
+            self.assertNotIn("1", account["first_seen"])
+            self.assertNotIn("1", account["manual_pending"])
 
     def test_overlapping_checks_are_rejected_instead_of_writing_twice(self) -> None:
         self.assertTrue(automation._run_lock.acquire(blocking=False))

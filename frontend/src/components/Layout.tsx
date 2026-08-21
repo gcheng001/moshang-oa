@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { Briefcase, ClipboardCheck, History, LayoutGrid, LogOut, Scale } from "lucide-react";
 import { api } from "../api";
-import type { User } from "../types";
+import type { User, VersionInfo } from "../types";
 
 const NAV = [
   { to: "/cases", label: "案件列表", icon: LayoutGrid },
@@ -28,9 +28,25 @@ export function Layout({ user, onLogout }: { user: User; onLogout: () => void })
 
   const [pendingCount, setPendingCount] = useState(0);
   const [hasNew, setHasNew] = useState(false);
+  const [version, setVersion] = useState<VersionInfo | null>(null);
   const idsRef = useRef<number[]>([]);
   const onApprovalsRef = useRef(false);
   onApprovalsRef.current = location.pathname.startsWith("/approvals");
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .version()
+      .then((info) => {
+        if (!cancelled) setVersion(info);
+      })
+      .catch(() => {
+        /* 后端暂未启动时静默忽略，侧边栏不显示版本号 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const markSeen = useCallback(() => {
     localStorage.setItem(SEEN_KEY, JSON.stringify(idsRef.current));
@@ -128,6 +144,13 @@ export function Layout({ user, onLogout }: { user: User; onLogout: () => void })
         </nav>
 
         <div className="border-t border-zinc-200 p-3">
+          {version && (
+            <div className="mb-1 px-2 text-[10px] text-zinc-400" title={`规则版本 ${version.rule_version}`}>
+              <span className="font-mono">v{version.app_version}</span>
+              <span className="mx-1">·</span>
+              <span>规则 {version.rule_version}</span>
+            </div>
+          )}
           <div className="flex items-center gap-2.5 rounded-lg px-2 py-1.5">
             <div className="flex h-8 w-8 items-center justify-center rounded-full bg-zinc-200 text-xs font-semibold text-zinc-600">
               {(user.employeeName || user.userName || "?").slice(0, 1)}

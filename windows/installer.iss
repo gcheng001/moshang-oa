@@ -4,7 +4,7 @@
 
 #define MyAppName "办公助手"
 #define MyAppNameASCII "MoshangOA"
-#define MyAppVersion "2.3.0"
+#define MyAppVersion "2.3.3"
 #define MyAppPublisher "摩尚律师事务所"
 #define MyAppExeName "办公助手"
 

@@ -46,6 +46,16 @@ def api_health() -> dict[str, str]:
     return {"app": APP_ID, "version": APP_VERSION}
 
 
+@app.get("/api/version")
+def api_version() -> dict[str, str]:
+    """返回当前 APP 版本与审批规则版本，便于用户在 UI 内核对运行版本。"""
+    return {
+        "app_id": APP_ID,
+        "app_version": APP_VERSION,
+        "rule_version": automation.RULE_VERSION,
+    }
+
+
 def require_session(x_session_id: str | None = Header(default=None)) -> sessions.Session:
     try:
         session = sessions.get(x_session_id)
@@ -323,6 +333,8 @@ class ApproveBody(BaseModel):
     conflict_memo: str = ""
     risk_reviewed: bool = False
     risk_memo: str = ""
+    duplicate_reviewed: bool = False
+    duplicate_memo: str = ""
 
 
 class RejectBody(BaseModel):
@@ -493,6 +505,8 @@ def api_approve(
         conflict_reviewed=body.conflict_reviewed,
         conflict_memo=body.conflict_memo,
         risk_reviewed=body.risk_reviewed,
+        duplicate_reviewed=body.duplicate_reviewed,
+        duplicate_memo=body.duplicate_memo,
     )
     if gate_errors:
         raise HTTPException(status_code=409, detail={"gate_errors": gate_errors})
@@ -502,6 +516,8 @@ def api_approve(
         memo = f"{memo}\n利冲复核：{body.conflict_memo.strip()}".strip()
     if body.risk_memo.strip():
         memo = f"{memo}\n风险收费复核：{body.risk_memo.strip()}".strip()
+    if body.duplicate_memo.strip():
+        memo = f"{memo}\n重复立案复核：{body.duplicate_memo.strip()}".strip()
 
     fresh = oa_call(oa.get_case_detail, session.base_url, session.token, lawcase_id)
     fresh_status = oa.row_status(fresh)
@@ -518,6 +534,8 @@ def api_approve(
         conflict_reviewed=body.conflict_reviewed,
         conflict_memo=body.conflict_memo,
         risk_reviewed=body.risk_reviewed,
+        duplicate_reviewed=body.duplicate_reviewed,
+        duplicate_memo=body.duplicate_memo,
     )
     if fresh_gate_errors:
         raise HTTPException(status_code=409, detail={"gate_errors": fresh_gate_errors})

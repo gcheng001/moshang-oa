@@ -9,6 +9,7 @@ import type {
   DocTemplatesResponse,
   PendingResponse,
   User,
+  VersionInfo,
 } from "./types";
 
 const SESSION_KEY = "moshang_session_id";
@@ -162,6 +163,10 @@ export const api = {
     return request("/api/approvals/pending");
   },
 
+  version(): Promise<VersionInfo> {
+    return request("/api/version");
+  },
+
   approvalCheck(id: number): Promise<ApprovalReview> {
     return request(`/api/approvals/case/${id}/check`);
   },
@@ -174,6 +179,8 @@ export const api = {
       conflict_memo: string;
       risk_reviewed: boolean;
       risk_memo: string;
+      duplicate_reviewed: boolean;
+      duplicate_memo: string;
     },
   ): Promise<{ ok: boolean; case_no: string; new_status_name: string }> {
     return request(`/api/approvals/${id}/approve`, { method: "POST", body: JSON.stringify(body) });

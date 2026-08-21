@@ -191,6 +191,7 @@ export interface ApprovalReview {
     result: string;
     blockers: string[];
     findings: DuplicateFinding[];
+    informational?: DuplicateFinding[];
     limitations: string[];
   };
   fee_explanation: {
@@ -221,4 +222,9 @@ export interface ApprovalReview {
   };
   gate_errors: string[];
   detail: Record<string, unknown>;
+}
+export interface VersionInfo {
+  app_id: string;
+  app_version: string;
+  rule_version: string;
 }

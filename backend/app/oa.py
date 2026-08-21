@@ -522,8 +522,17 @@ def _cause_suggestions(cause_norm: str, heads: list[dict[str, Any]], limit: int 
 
 
 def cause_review(base_url: str, token: str, detail: dict[str, Any]) -> dict[str, Any]:
-    """案由规范性审查：案由/罪名必须命中 OA 系统案由字典，自由填写文本阻断。"""
+    """案由规范性审查：除公益法律外，案由/罪名必须命中 OA 系统案由字典。"""
     cause_text = str(detail.get("causeAction") or detail.get("caseHeadName") or "").strip()
+    if normalized_case_type(detail) == "公益法律":
+        return {
+            "result": "not_applicable",
+            "cause_text": cause_text or None,
+            "matches": [],
+            "blockers": [],
+            "warnings": ["公益法律不要求案由，不作 OA 案由字典匹配"],
+            "suggestions": [],
+        }
     head_name = str(detail.get("caseHeadName") or "").strip()
     if not cause_text:
         # 案由缺失由资料完整性阻断，此处不重复报
@@ -590,6 +599,15 @@ LITIGATION_CASE_TYPES = {
 }
 NON_LITIGATION_BASE_TYPES = {"咨询代书", "顾问签约", "非诉业务", "公益法律"}
 GENERIC_FEE_MEMOS = {"特殊情况", "情况特殊", "领导同意", "已沟通", "客户原因", "其他", "无", "暂无"}
+PRIOR_CHARGE_CONTEXTS = (
+    "前所", "原所", "此前", "之前", "先前", "前期", "一审", "原审", "前审", "上一审", "上一阶段", "前一阶段",
+)
+CURRENT_CHARGE_CONTEXTS = ("本案", "本阶段", "本审", "二审", "再审", "执行")
+CURRENT_ZERO_FEE_PATTERN = re.compile(
+    r"(?:本案|本阶段|本审|二审|再审|执行(?:案件|阶段)?)"
+    r"[^，。；;\n]{0,16}"
+    r"(?:不再收费|不再另行收费|不再收取费用|不另收费|不另行收费|无需收费|不收取费用|免费|无偿)"
+)
 
 
 def normalized_case_type(detail: dict[str, Any]) -> str:
@@ -622,6 +640,41 @@ def _first_value(detail: dict[str, Any], entity: dict[str, Any], *keys: str) -> 
 def _meaningful_memo(value: Any) -> bool:
     text = re.sub(r"\s+", "", str(value or ""))
     return len(text) >= 4 and text not in GENERIC_FEE_MEMOS
+
+
+def _explains_zero_fee_after_prior_charge(memo: str) -> bool:
+    """Whether a zero-fee memo clearly separates a prior charge from this engagement."""
+    text = re.sub(r"\s+", "", memo or "")
+    zero_fee = CURRENT_ZERO_FEE_PATTERN.search(text)
+    if not zero_fee:
+        return False
+    prefix = text[: zero_fee.start()]
+    has_prior_charge = False
+    for pattern in (_ARABIC_AMOUNT, _BARE_UNIT_AMOUNT, _CN_AMOUNT):
+        for match in pattern.finditer(prefix):
+            clause = re.split(r"[，。；;\n]", prefix[: match.start()])[-1]
+            if any(marker in clause for marker in CURRENT_CHARGE_CONTEXTS):
+                return False
+            if any(marker in clause for marker in PRIOR_CHARGE_CONTEXTS):
+                has_prior_charge = True
+    return has_prior_charge
+
+
+def _current_instance_name(detail: dict[str, Any]) -> str:
+    direct = str(detail.get("currentInstanceName") or "").strip()
+    if direct:
+        return direct
+    instances = detail.get("instances")
+    if not isinstance(instances, list):
+        return ""
+    current = [row for row in instances if isinstance(row, dict) and row.get("isCurrent")]
+    candidates = current or ([instances[0]] if len(instances) == 1 else [])
+    for row in candidates:
+        if isinstance(row, dict):
+            name = str(row.get("name") or row.get("instanceName") or "").strip()
+            if name:
+                return name
+    return ""
 
 
 def _option_id(value: Any) -> Any:
@@ -665,9 +718,18 @@ def system_option_review(
         }
     blockers: list[str] = []
     technical_errors: list[str] = []
-    category_id = _option_id(entity.get("caseCategory") or detail.get("caseCategory") or detail.get("caseCategoryId"))
-    if not category_id:
-        blockers.append("案件分类不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
+    if case_type == "公益法律":
+        # 公益法律只有系统大类（实际数据 baseType=11），没有必填子分类。
+        # 因此验证大类系统 ID，不能用空 caseCategory 将合法公益案件驳回。
+        base_type_id = _option_id(entity.get("baseType") or detail.get("baseTypeId"))
+        if not base_type_id:
+            blockers.append("公益法律大类不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
+    else:
+        category_id = _option_id(
+            entity.get("caseCategory") or detail.get("caseCategory") or detail.get("caseCategoryId")
+        )
+        if not category_id:
+            blockers.append("案件分类不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
     if case_type != "公益法律" and not _option_id(entity.get("chargeMethd") or detail.get("chargeMethodId")):
         blockers.append("收费方式不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
     if case_type in LITIGATION_CASE_TYPES and not _has_system_instance(detail, entity):
@@ -726,15 +788,15 @@ def completeness_review(
     summary = _first_value(detail, entity, "caseSummary", "CaseSummary", "projectName", "serviceItem", "matterName", "服务事项")
     checks: dict[str, Any] = {"经办律师": lawyer}
     if case_type == "公益法律":
-        checks.update({"服务对象": principals, "公益事项": summary or cause})
+        checks.update({"服务对象": principals})
         amount = decimal_value(detail.get("chargeAmount"))
         if amount is not None and amount > 0:
             checks["公益法律不得登记收费金额"] = None
     elif case_type == "顾问签约":
         checks.update({
             "客户名称": principals,
-            "顾问开始日期": _first_value(detail, entity, "serviceStartDate", "startDate", "contractStartDate", "GuWenStartDate"),
-            "顾问结束日期": _first_value(detail, entity, "serviceEndDate", "endDate", "contractEndDate", "GuWenEndDate"),
+            "顾问开始日期": _first_value(detail, entity, "GW_StartDate"),
+            "顾问结束日期": _first_value(detail, entity, "GW_EndDate"),
             "收费方式": charge_method,
         })
     elif case_type == "非诉业务":
@@ -745,18 +807,16 @@ def completeness_review(
         checks.update({"委托人或实际服务对象": principals, "涉嫌罪名或案件事项": cause, "案件阶段及辩护或代理身份": instance, "收费方式": charge_method})
     elif case_type == "执行案件":
         checks.update({
-            "申请执行人": principals, "被执行人": opponents,
-            "执行依据或原审案号": _first_value(detail, entity, "originalCaseNo", "executionBasis", "caseSummary", "CaseSummary"),
             "执行事项": cause or summary, "执行阶段": instance, "收费方式": charge_method,
         })
-        if _first_value(detail, entity, "biaodi", "Biaodi", "executionAmount") in (None, "") and not _meaningful_memo(
+        if _first_value(detail, entity, "Biaodi") in (None, "") and not _meaningful_memo(
             _first_value(detail, entity, "caseMemo", "CaseMemo", "ChargeMemo")
         ):
             checks["申请执行金额或无金额事项具体说明"] = None
     elif case_type == "仲裁业务":
         checks.update({
             "委托人": principals, "对方当事人": opponents, "仲裁争议事项或系统案由": cause,
-            "仲裁机构": _first_value(detail, entity, "arbitrationInstitution", "arbitrationCommission", "courtName"),
+            "仲裁机构": _first_value(detail, entity, "Zhongcai"),
             "代理阶段及代理方": instance, "收费方式": charge_method,
         })
     elif case_type == "赔偿案件":
@@ -764,7 +824,7 @@ def completeness_review(
     elif case_type == "破产案件（诉讼）":
         checks.update({
             "委托人": principals, "债务人或主要相关主体": opponents,
-            "委托人身份": _first_value(detail, entity, "clientRole", "partyRole", "WTQXContent"),
+            "委托人身份": _first_value(detail, entity, "WeituoBuchong"),
             "破产事项或系统案由": cause, "办理阶段及代理身份": instance, "收费方式": charge_method,
         })
     else:
@@ -820,6 +880,15 @@ def fee_explanation_review(
             "blockers": [f"委托收费 {amount} 元低于 5000 元，必须填写具体低收费理由，不能使用“特殊情况/领导同意”等笼统说明"],
         }
     memo_amounts = extract_fee_amounts(memo)
+    if amount == 0 and _explains_zero_fee_after_prior_charge(memo):
+        return {
+            "result": "ok",
+            "amount": 0.0,
+            "memo": memo,
+            "memo_amounts": [float(a) for a in memo_amounts],
+            "prior_charge_explanation": True,
+            "blockers": [],
+        }
     if not fee_amounts_match(amount, memo_amounts):
         return {
             "result": "blocked",
@@ -917,6 +986,9 @@ def duplicate_filing_review(base_url: str, token: str, detail: dict[str, Any], l
 
     blockers: list[str] = []
     findings: list[dict[str, Any]] = []
+    informational: list[dict[str, Any]] = []
+    current_case_type = normalized_case_type(detail)
+    current_stage = _current_instance_name(detail)
     for row_id, row in candidates.items():
         row_principals = {normalize_name(x): x for x in split_names(row.get("wtrNames") or row.get("dsrNames"))}
         row_opponents = {normalize_name(x): x for x in split_names(row.get("tosNames"))}
@@ -931,9 +1003,31 @@ def duplicate_filing_review(base_url: str, token: str, detail: dict[str, Any], l
 
         exact_triple = bool(principal_overlap and opponent_overlap and cause_match)
         if exact_triple and status in ACTIVE_DUPLICATE_STATUSES:
-            severity = "block"
-            relation = "同委托人+同对方+同案由的OA在办/待处理案件"
-            blockers.append(f"OA内疑似重复立案: {row.get('no') or row.get('preNo') or row_id} {relation}")
+            try:
+                matched_detail = get_case_detail(base_url, token, row_id)
+            except Exception:
+                matched_detail = row
+            matched_case_type = normalized_case_type(matched_detail) or normalized_case_type(row)
+            matched_stage = _current_instance_name(matched_detail)
+            different_case_type = bool(
+                current_case_type and matched_case_type and current_case_type != matched_case_type
+            )
+            different_stage = bool(current_stage and matched_stage and current_stage != matched_stage)
+            if different_case_type or different_stage:
+                severity = "info"
+                if different_case_type:
+                    relation = (
+                        f"同一当事人与案由，但属于不同案件类型/程序阶段："
+                        f"原案{matched_case_type or '未识别'}，本案{current_case_type or '未识别'}，不按重复立案处理"
+                    )
+                else:
+                    relation = (
+                        f"同一当事人与案由，但属于不同程序阶段："
+                        f"原案{matched_stage}，本案{current_stage}，不按重复立案处理"
+                    )
+            else:
+                severity = "review"
+                relation = "同委托人+同对方+同案由且处于相同或无法识别的程序阶段，需合伙人复核是否另案"
         elif exact_triple and status == 2:
             severity = "review"
             relation = "同委托人+同对方+同案由的历史「立案未通过」记录，可能为驳回后重新申报，请核对前次驳回问题是否已补正"
@@ -941,38 +1035,46 @@ def duplicate_filing_review(base_url: str, token: str, detail: dict[str, Any], l
             severity = "review"
             relation = "同委托人+同对方+同案由的历史案件（已结案/已撤销/已归档），请判断是否为新阶段立案"
         elif (cause_match and any_party_overlap) or (principal_overlap and opponent_overlap):
-            severity = "review"
-            relation = "部分当事人/案由重叠，需合伙人判断是否关联或重复"
+            severity = "info"
+            relation = "部分当事人/案由重叠，仅作关联案件提示，不按重复立案处理"
         else:
             continue
 
-        findings.append(
-            {
-                "severity": severity,
-                "relation": relation,
-                "case_id": row_id,
-                "case_no": row.get("no") or row.get("preNo"),
-                "status": status,
-                "status_name": row.get("statusName"),
-                "wtr_names": row.get("wtrNames"),
-                "tos_names": row.get("tosNames"),
-                "cause": row.get("causeAction") or row.get("caseHeadName"),
-                "emp_names": row.get("empNames"),
-                "principal_overlap": principal_overlap,
-                "opponent_overlap": opponent_overlap,
-                "cause_match": cause_match,
-            }
-        )
+        item = {
+            "severity": severity,
+            "relation": relation,
+            "case_id": row_id,
+            "case_no": row.get("no") or row.get("preNo"),
+            "status": status,
+            "status_name": row.get("statusName"),
+            "wtr_names": row.get("wtrNames"),
+            "tos_names": row.get("tosNames"),
+            "cause": row.get("causeAction") or row.get("caseHeadName"),
+            "emp_names": row.get("empNames"),
+            "principal_overlap": principal_overlap,
+            "opponent_overlap": opponent_overlap,
+            "cause_match": cause_match,
+        }
+        if severity == "info":
+            informational.append(item)
+        else:
+            findings.append(item)
 
     return {
-        "result": "blocked" if blockers else ("manual_review_required" if findings else "no_duplicate_filing_match"),
+        "result": (
+            "blocked" if blockers else
+            "manual_review_required" if findings else
+            "related_stage_match" if informational else
+            "no_duplicate_filing_match"
+        ),
         "principals": principals,
         "opponents": opponents,
         "cause": detail.get("causeAction") or detail.get("caseHeadName"),
         "blockers": blockers,
         "findings": findings,
+        "informational": informational,
         "limitations": [
-            "按OA可见案件做名称与案由精确匹配",
+            "按OA可见案件做名称、案由、案件类型与当前程序阶段比对",
             "同名不同主体、案由登记不一致、未录入OA案件仍须人工复核",
         ],
     }
@@ -1191,6 +1293,8 @@ def approval_gate_errors(
     conflict_reviewed: bool = False,
     conflict_memo: str = "",
     risk_reviewed: bool = False,
+    duplicate_reviewed: bool = False,
+    duplicate_memo: str = "",
 ) -> list[str]:
     errors = [f"资料不完整: {v}" for v in (review["completeness"].get("missing") or [])]
     errors.extend(review.get("system_options", {}).get("blockers") or [])
@@ -1199,7 +1303,14 @@ def approval_gate_errors(
     findings = review["conflict"].get("findings") or []
     if findings and not (conflict_reviewed and conflict_memo.strip()):
         errors.append("存在利冲检索命中，须确认合伙人已人工复核并填写复核结论")
-    errors.extend(review.get("duplicate_filing", {}).get("blockers") or [])
+    duplicate = review.get("duplicate_filing", {})
+    duplicate_blockers = duplicate.get("blockers") or []
+    duplicate_findings = duplicate.get("findings") or []
+    # 重复立案硬阻断与线索均可由合伙人人工覆写（另案收费/关联案件等）
+    if (duplicate_blockers or duplicate_findings) and not (duplicate_reviewed and duplicate_memo.strip()):
+        errors.extend(duplicate_blockers)
+        if duplicate_findings and not duplicate_blockers:
+            errors.append("存在当事人/案由重叠案件，须确认合伙人已人工复核并填写复核结论")
     errors.extend(review.get("fee_explanation", {}).get("blockers") or [])
     risk = review["risk_charge"]
     certain = risk.get("prohibited_certain") or []

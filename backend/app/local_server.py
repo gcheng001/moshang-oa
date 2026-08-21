@@ -8,7 +8,7 @@ import time
 from urllib.request import urlopen
 
 APP_ID = "com.moshang.office-assistant"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.3"
 
 
 def port_in_use(host: str, port: int) -> bool:
